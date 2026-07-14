@@ -13,28 +13,37 @@ from werkzeug.security import generate_password_hash, check_password_hash
 app = Flask(__name__)
 
 # --- Configuration ---
-app.config['SECRET_KEY'] = os.environ.get('SECRET_KEY', 'super-secret-scaneats-key-2024')
+app.config['SECRET_KEY'] = os.environ.get(
+    'SECRET_KEY',
+    'super-secret-scaneats-key-2024'
+)
 
-# Dynamic Database Configuration (PostgreSQL for Render, SQLite for Local)
-db_url = os.environ.get('DATABASE_URL')
+DATABASE_URL = os.environ.get("DATABASE_URL")
 
-if db_url:
-    # Render ka URL agar 'postgres://' se shuru ho, toh SQLAlchemy ke liye use 'postgresql://' me badlo
-    if db_url.startswith("postgres://"):
-        db_url = db_url.replace("postgres://", "postgresql://", 1)
+if DATABASE_URL:
+    if DATABASE_URL.startswith("postgres://"):
+        DATABASE_URL = DATABASE_URL.replace("postgres://", "postgresql://", 1)
+    app.config["SQLALCHEMY_DATABASE_URI"] = DATABASE_URL
 else:
-    # Local fallback to SQLite
-    basedir = os.path.abspath(os.path.dirname(__file__))
-    db_url = 'sqlite:///' + os.path.join(basedir, 'scaneats.db')
+    app.config["SQLALCHEMY_DATABASE_URI"] = "sqlite:///scaneats.db"
 
-app.config['SQLALCHEMY_DATABASE_URI'] = db_url
 app.config['SQLALCHEMY_TRACK_MODIFICATIONS'] = False
 
-# Aapka actual frontend Vercel URL yahan dalega production ke liye
-FRONTEND_URL = os.environ.get('FRONTEND_URL', 'https://scaneats-jpgzsqp0d-codewithahmed2005-gmailcoms-projects.vercel.app')
+# --- CORS Setup (FIXED) ---
+CORS(app, 
+     origins=["https://codewithahmed2005.github.io", "http://127.0.0.1:5500", "http://localhost:5500", "*"],
+     methods=["GET", "POST", "PUT", "DELETE", "OPTIONS"],
+     allow_headers=["Content-Type", "Authorization", "Accept"],
+     supports_credentials=True)
 
-# --- CORS Setup ---
-CORS(app, resources={r"/*": {"origins": "*"}})
+# --- Alternative: After Request CORS Headers (Extra Safety) ---
+@app.after_request
+def after_request(response):
+    response.headers.add('Access-Control-Allow-Origin', '*')
+    response.headers.add('Access-Control-Allow-Headers', 'Content-Type, Authorization, Accept')
+    response.headers.add('Access-Control-Allow-Methods', 'GET, POST, PUT, DELETE, OPTIONS')
+    response.headers.add('Access-Control-Allow-Credentials', 'true')
+    return response
 
 db = SQLAlchemy(app)
 
@@ -45,12 +54,13 @@ class Restaurant(db.Model):
     owner_name = db.Column(db.String(120), nullable=False)
     email = db.Column(db.String(120), unique=True, nullable=False)
     password_hash = db.Column(db.String(255), nullable=False)
-    upi_id = db.Column(db.String(50), nullable=True)      
-    logo_url = db.Column(db.String(255), nullable=True)   
+    upi_id = db.Column(db.String(50), nullable=True)
+    logo_url = db.Column(db.String(255), nullable=True)
     menu_items = db.relationship('MenuItem', backref='restaurant', lazy=True, cascade='all, delete-orphan')
 
     def set_password(self, password): 
         self.password_hash = generate_password_hash(password)
+    
     def check_password(self, password): 
         return check_password_hash(self.password_hash, password)
 
@@ -62,7 +72,7 @@ class MenuItem(db.Model):
     price = db.Column(db.Float, nullable=False)
     category = db.Column(db.String(50), nullable=False)
     is_veg = db.Column(db.Boolean, default=True)
-    is_active = db.Column(db.Boolean, default=True) 
+    is_active = db.Column(db.Boolean, default=True)
 
 # --- Auth Decorator (JWT) ---
 def token_required(f):
@@ -70,34 +80,29 @@ def token_required(f):
     def decorated(*args, **kwargs):
         token = None
         if 'Authorization' in request.headers:
-            try:
-                token = request.headers['Authorization'].split(" ")[1]
-            except IndexError:
-                return jsonify({'error': 'Token format invalid!'}), 401
+            token = request.headers['Authorization'].split(" ")[1]
             
         if not token:
             return jsonify({'error': 'Token is missing!'}), 401
             
         try:
             data = jwt.decode(token, app.config['SECRET_KEY'], algorithms=["HS256"])
-            current_restaurant = db.session.get(Restaurant, data['restaurant_id'])
+            current_restaurant = Restaurant.query.get(data['restaurant_id'])
             if not current_restaurant:
                 return jsonify({'error': 'Invalid token!'}), 401
         except Exception as e:
-            return jsonify({'error': 'Token is invalid or expired!'}), 401
+            return jsonify({'error': 'Token is invalid!'}), 401
             
         return f(current_restaurant, *args, **kwargs)
     return decorated
 
-# --- Root/Health Route for Render Verification ---
-@app.route('/')
-def home():
-    return jsonify({"status": "healthy", "app": "ScanEats Backend"}), 200
-
 # --- Auth Routes ---
-@app.route('/api/signup', methods=['POST'])
+@app.route('/api/signup', methods=['POST', 'OPTIONS'])
 def signup():
-    data = request.get_json() or {}
+    if request.method == 'OPTIONS':
+        return jsonify({'success': True}), 200
+    
+    data = request.get_json()
     
     if Restaurant.query.filter_by(email=data.get('email')).first():
         return jsonify({'error': 'Email already registered'}), 400
@@ -113,30 +118,41 @@ def signup():
     
     token = jwt.encode({
         'restaurant_id': restaurant.id,
-        'exp': datetime.datetime.now(datetime.timezone.utc) + datetime.timedelta(days=30)
+        'exp': datetime.datetime.utcnow() + datetime.timedelta(days=30)
     }, app.config['SECRET_KEY'], algorithm="HS256")
     
     return jsonify({
         'success': True, 
         'token': token,
-        'restaurant': {'id': restaurant.id, 'name': restaurant.restaurant_name, 'owner': restaurant.owner_name}
+        'restaurant': {
+            'id': restaurant.id, 
+            'name': restaurant.restaurant_name, 
+            'owner': restaurant.owner_name
+        }
     }), 201
 
-@app.route('/api/login', methods=['POST'])
+@app.route('/api/login', methods=['POST', 'OPTIONS'])
 def login():
-    data = request.get_json() or {}
+    if request.method == 'OPTIONS':
+        return jsonify({'success': True}), 200
+    
+    data = request.get_json()
     restaurant = Restaurant.query.filter_by(email=data.get('email')).first()
     
     if restaurant and restaurant.check_password(data.get('password')):
         token = jwt.encode({
             'restaurant_id': restaurant.id,
-            'exp': datetime.datetime.now(datetime.timezone.utc) + datetime.timedelta(days=30)
+            'exp': datetime.datetime.utcnow() + datetime.timedelta(days=30)
         }, app.config['SECRET_KEY'], algorithm="HS256")
         
         return jsonify({
             'success': True,
             'token': token,
-            'restaurant': {'id': restaurant.id, 'name': restaurant.restaurant_name, 'owner': restaurant.owner_name}
+            'restaurant': {
+                'id': restaurant.id, 
+                'name': restaurant.restaurant_name, 
+                'owner': restaurant.owner_name
+            }
         })
         
     return jsonify({'error': 'Invalid email or password'}), 401
@@ -148,34 +164,48 @@ def get_me(current_restaurant):
         'id': current_restaurant.id,
         'restaurant_name': current_restaurant.restaurant_name,
         'owner_name': current_restaurant.owner_name,
-        'upi_id': current_restaurant.upi_id,     
-        'logo_url': current_restaurant.logo_url  
+        'upi_id': current_restaurant.upi_id,
+        'logo_url': current_restaurant.logo_url
     })
 
-@app.route('/api/profile', methods=['PUT'])
+# --- Profile Settings Route ---
+@app.route('/api/profile', methods=['PUT', 'OPTIONS'])
 @token_required
 def update_profile(current_restaurant):
-    data = request.get_json() or {}
-    if 'restaurant_name' in data: current_restaurant.restaurant_name = data['restaurant_name']
-    if 'upi_id' in data: current_restaurant.upi_id = data['upi_id']
-    if 'logo_url' in data: current_restaurant.logo_url = data['logo_url']
+    if request.method == 'OPTIONS':
+        return jsonify({'success': True}), 200
+    
+    data = request.get_json()
+    if 'restaurant_name' in data: 
+        current_restaurant.restaurant_name = data['restaurant_name']
+    if 'upi_id' in data: 
+        current_restaurant.upi_id = data['upi_id']
+    if 'logo_url' in data: 
+        current_restaurant.logo_url = data['logo_url']
     db.session.commit()
     return jsonify({'success': True})
 
 # --- Menu CRUD Routes ---
-@app.route('/api/menu-items', methods=['GET', 'POST'])
+@app.route('/api/menu-items', methods=['GET', 'POST', 'OPTIONS'])
 @token_required
 def handle_menu_items(current_restaurant):
-    if request.method == 'GET':
+    if request.method == 'OPTIONS':
+        return jsonify({'success': True}), 200
+    
+    if request.method == 'GET':  # FIXED: Removed extra bracket
         items = MenuItem.query.filter_by(restaurant_id=current_restaurant.id).all()
         return jsonify([{
-            'id': i.id, 'name': i.name, 'description': i.description,
-            'price': i.price, 'category': i.category, 'is_veg': i.is_veg,
+            'id': i.id, 
+            'name': i.name, 
+            'description': i.description,
+            'price': i.price, 
+            'category': i.category, 
+            'is_veg': i.is_veg,
             'is_active': i.is_active
         } for i in items])
         
     elif request.method == 'POST':
-        data = request.get_json() or {}
+        data = request.get_json()
         item = MenuItem(
             restaurant_id=current_restaurant.id,
             name=data['name'],
@@ -188,26 +218,33 @@ def handle_menu_items(current_restaurant):
         db.session.commit()
         return jsonify({'success': True, 'item': {'id': item.id}}), 201
 
-@app.route('/api/menu/toggle/<int:item_id>', methods=['PUT'])
+# Toggle Active/Inactive Endpoint
+@app.route('/api/menu/toggle/<int:item_id>', methods=['PUT', 'OPTIONS'])
 @token_required
 def toggle_item_status(current_restaurant, item_id):
+    if request.method == 'OPTIONS':
+        return jsonify({'success': True}), 200
+    
     item = MenuItem.query.filter_by(id=item_id, restaurant_id=current_restaurant.id).first()
     if not item:
         return jsonify({'error': 'Item not found'}), 404
         
-    item.is_active = not item.is_active 
+    item.is_active = not item.is_active
     db.session.commit()
     return jsonify({'success': True, 'is_active': item.is_active})
 
-@app.route('/api/menu-items/<int:item_id>', methods=['PUT', 'DELETE'])
+@app.route('/api/menu-items/<int:item_id>', methods=['PUT', 'DELETE', 'OPTIONS'])
 @token_required
 def update_delete_item(current_restaurant, item_id):
+    if request.method == 'OPTIONS':
+        return jsonify({'success': True}), 200
+    
     item = MenuItem.query.filter_by(id=item_id, restaurant_id=current_restaurant.id).first()
     if not item:
         return jsonify({'error': 'Item not found'}), 404
         
     if request.method == 'PUT':
-        data = request.get_json() or {}
+        data = request.get_json()
         item.name = data['name']
         item.description = data.get('description', '')
         item.price = float(data['price'])
@@ -222,10 +259,15 @@ def update_delete_item(current_restaurant, item_id):
         return jsonify({'success': True})
 
 # --- QR Code Generation ---
-@app.route('/api/generate-qr', methods=['POST'])
+@app.route('/api/generate-qr', methods=['POST', 'OPTIONS'])
 @token_required
 def generate_qr(current_restaurant):
+    if request.method == 'OPTIONS':
+        return jsonify({'success': True}), 200
+    
     try:
+        # FRONTEND_URL - Change this to your deployed frontend URL
+        FRONTEND_URL = "https://codewithahmed2005.github.io/ScanEats"  # CHANGE THIS
         menu_url = f"{FRONTEND_URL}/menu.html?id={current_restaurant.id}"
         
         qr = qrcode.QRCode(version=1, box_size=10, border=4)
@@ -244,10 +286,13 @@ def generate_qr(current_restaurant):
     except Exception as e:
         return jsonify({'error': str(e)}), 500
 
-# --- Public Menu Route ---
-@app.route('/api/menu/<int:restaurant_id>', methods=['GET'])
+# --- Public Menu Route (Filters out inactive items) ---
+@app.route('/api/menu/<int:restaurant_id>', methods=['GET', 'OPTIONS'])
 def get_public_menu(restaurant_id):
-    restaurant = db.session.get(Restaurant, restaurant_id)
+    if request.method == 'OPTIONS':
+        return jsonify({'success': True}), 200
+    
+    restaurant = Restaurant.query.get(restaurant_id)
     if not restaurant:
         return jsonify({'error': 'Restaurant not found'}), 404
         
@@ -258,15 +303,19 @@ def get_public_menu(restaurant_id):
         'upi_id': restaurant.upi_id,
         'logo_url': restaurant.logo_url,
         'items': [{
-            'id': i.id, 'name': i.name, 'description': i.description,
-            'price': i.price, 'category': i.category, 'is_veg': i.is_veg
+            'id': i.id, 
+            'name': i.name, 
+            'description': i.description,
+            'price': i.price, 
+            'category': i.category, 
+            'is_veg': i.is_veg
         } for i in items]
     })
 
-# Initialize DB safely on start
-with app.app_context():
-    db.create_all()
+if __name__ == "__main__":
+    with app.app_context():
+        db.create_all()
+        print("✅ Database initialized!")
 
-if __name__ == '__main__':
-    port = int(os.environ.get('PORT', 5000))
-    app.run(host='0.0.0.0', port=port)
+    port = int(os.environ.get("PORT", 5000))
+    app.run(host="0.0.0.0", port=port)
