@@ -35,7 +35,6 @@ FRONTEND_URL = "http://127.0.0.1:5500"
 # --- CORS Setup ---
 CORS(app, resources={r"/*": {"origins": "*"}})
 
-db = SQLAlchemy(app)
 
 # -------------------------------
 # Health Check Routes
@@ -56,6 +55,11 @@ def health():
     }), 200
 
 # --- Database Models ---
+db = SQLAlchemy(app)
+
+
+with app.app_context():
+    db.create_all()
 class Restaurant(db.Model):
     id = db.Column(db.Integer, primary_key=True)
     restaurant_name = db.Column(db.String(120), nullable=False)
