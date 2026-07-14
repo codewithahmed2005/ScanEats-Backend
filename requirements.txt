@@ -1,8 +1,8 @@
-Flask==3.0.0
+Flask==3.0.3
 Flask-SQLAlchemy==3.1.1
-Flask-CORS==4.0.0
+Flask-CORS==4.0.1
 PyJWT==2.8.0
-Werkzeug==3.0.1
-qrcode==7.4.2
-Pillow==10.2.0
+Werkzeug==3.0.3
+qrcode[pil]==7.4.2
+Pillow==11.3.0
 gunicorn==23.0.0
