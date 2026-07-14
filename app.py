@@ -17,7 +17,16 @@ app.config['SECRET_KEY'] = os.environ.get(
     'SECRET_KEY',
     'super-secret-scaneats-key-2024'
 )
-app.config['SQLALCHEMY_DATABASE_URI'] = 'sqlite:///scaneats.db'
+
+DATABASE_URL = os.environ.get("DATABASE_URL")
+
+if DATABASE_URL:
+    if DATABASE_URL.startswith("postgres://"):
+        DATABASE_URL = DATABASE_URL.replace("postgres://", "postgresql://", 1)
+
+    app.config["SQLALCHEMY_DATABASE_URI"] = DATABASE_URL
+else:
+    app.config["SQLALCHEMY_DATABASE_URI"] = "sqlite:///scaneats.db"
 app.config['SQLALCHEMY_TRACK_MODIFICATIONS'] = False
 
 # Yahan apna frontend URL daalein (Local testing ke liye)
