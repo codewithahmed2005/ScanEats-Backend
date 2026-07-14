@@ -20,8 +20,6 @@ app.config['SECRET_KEY'] = os.environ.get(
 
 DATABASE_URL = os.environ.get("DATABASE_URL")
 
-DATABASE_URL = os.environ.get("DATABASE_URL")
-
 if not DATABASE_URL:
     raise RuntimeError("DATABASE_URL environment variable is not set.")
 
@@ -61,6 +59,7 @@ db = SQLAlchemy(app)
 
 with app.app_context():
     db.create_all()
+    
 class Restaurant(db.Model):
     id = db.Column(db.Integer, primary_key=True)
     restaurant_name = db.Column(db.String(120), nullable=False)
