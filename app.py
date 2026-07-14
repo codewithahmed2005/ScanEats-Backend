@@ -37,6 +37,24 @@ CORS(app, resources={r"/*": {"origins": "*"}})
 
 db = SQLAlchemy(app)
 
+# -------------------------------
+# Health Check Routes
+# -------------------------------
+
+@app.route("/", methods=["GET"])
+def home():
+    return jsonify({
+        "status": "ok",
+        "message": "ScanEats Backend is Running 🚀"
+    }), 200
+
+
+@app.route("/api/health", methods=["GET"])
+def health():
+    return jsonify({
+        "status": "healthy"
+    }), 200
+
 # --- Database Models ---
 class Restaurant(db.Model):
     id = db.Column(db.Integer, primary_key=True)
@@ -86,30 +104,44 @@ def token_required(f):
 # --- Auth Routes ---
 @app.route('/api/signup', methods=['POST'])
 def signup():
-    data = request.get_json()
-    
-    if Restaurant.query.filter_by(email=data.get('email')).first():
-        return jsonify({'error': 'Email already registered'}), 400
-        
-    restaurant = Restaurant(
-        restaurant_name=data.get('restaurant_name'),
-        owner_name=data.get('owner_name'),
-        email=data.get('email')
-    )
-    restaurant.set_password(data.get('password'))
-    db.session.add(restaurant)
-    db.session.commit()
-    
-    token = jwt.encode({
-        'restaurant_id': restaurant.id,
-        'exp': datetime.datetime.utcnow() + datetime.timedelta(days=30)
-    }, app.config['SECRET_KEY'], algorithm="HS256")
-    
-    return jsonify({
-        'success': True, 
-        'token': token,
-        'restaurant': {'id': restaurant.id, 'name': restaurant.restaurant_name, 'owner': restaurant.owner_name}
-    }), 201
+    try:
+        data = request.get_json()
+
+        if Restaurant.query.filter_by(email=data.get('email')).first():
+            return jsonify({'error': 'Email already registered'}), 400
+
+        restaurant = Restaurant(
+            restaurant_name=data.get('restaurant_name'),
+            owner_name=data.get('owner_name'),
+            email=data.get('email')
+        )
+
+        restaurant.set_password(data.get('password'))
+
+        db.session.add(restaurant)
+        db.session.commit()
+
+        token = jwt.encode({
+            'restaurant_id': restaurant.id,
+            'exp': datetime.datetime.utcnow() + datetime.timedelta(days=30)
+        }, app.config['SECRET_KEY'], algorithm="HS256")
+
+        return jsonify({
+            'success': True,
+            'token': token,
+            'restaurant': {
+                'id': restaurant.id,
+                'name': restaurant.restaurant_name,
+                'owner': restaurant.owner_name
+            }
+        }), 201
+
+    except Exception as e:
+        import traceback
+        traceback.print_exc()
+        return jsonify({
+            "error": str(e)
+        }), 500
 
 @app.route('/api/login', methods=['POST'])
 def login():
