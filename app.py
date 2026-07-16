@@ -29,14 +29,14 @@ else:
 
 app.config['SQLALCHEMY_TRACK_MODIFICATIONS'] = False
 
-# --- CORS Setup (FIXED) ---
+# --- CORS Setup (FIXED - SIMPLE & WORKING) ---
 CORS(app, 
-     origins=["https://codewithahmed2005.github.io", "http://127.0.0.1:5500", "http://localhost:5500", "*"],
+     origins="*",  # Allow all origins for now
      methods=["GET", "POST", "PUT", "DELETE", "OPTIONS"],
      allow_headers=["Content-Type", "Authorization", "Accept"],
      supports_credentials=True)
 
-# --- Alternative: After Request CORS Headers (Extra Safety) ---
+# --- After Request CORS Headers (Extra Safety) ---
 @app.after_request
 def after_request(response):
     response.headers.add('Access-Control-Allow-Origin', '*')
@@ -46,10 +46,6 @@ def after_request(response):
     return response
 
 db = SQLAlchemy(app)
-
-with app.app_context():
-    db.create_all()
-    print("✅ Tables created successfully!")
 
 # --- Database Models ---
 class Restaurant(db.Model):
@@ -161,9 +157,11 @@ def login():
         
     return jsonify({'error': 'Invalid email or password'}), 401
 
-@app.route('/api/me', methods=['GET'])
+@app.route('/api/me', methods=['GET', 'OPTIONS'])
 @token_required
 def get_me(current_restaurant):
+    if request.method == 'OPTIONS':
+        return jsonify({'success': True}), 200
     return jsonify({
         'id': current_restaurant.id,
         'restaurant_name': current_restaurant.restaurant_name,
@@ -172,7 +170,6 @@ def get_me(current_restaurant):
         'logo_url': current_restaurant.logo_url
     })
 
-# --- Profile Settings Route ---
 @app.route('/api/profile', methods=['PUT', 'OPTIONS'])
 @token_required
 def update_profile(current_restaurant):
@@ -189,14 +186,13 @@ def update_profile(current_restaurant):
     db.session.commit()
     return jsonify({'success': True})
 
-# --- Menu CRUD Routes ---
 @app.route('/api/menu-items', methods=['GET', 'POST', 'OPTIONS'])
 @token_required
 def handle_menu_items(current_restaurant):
     if request.method == 'OPTIONS':
         return jsonify({'success': True}), 200
     
-    if request.method == 'GET':  # FIXED: Removed extra bracket
+    if request.method == 'GET':
         items = MenuItem.query.filter_by(restaurant_id=current_restaurant.id).all()
         return jsonify([{
             'id': i.id, 
@@ -222,7 +218,6 @@ def handle_menu_items(current_restaurant):
         db.session.commit()
         return jsonify({'success': True, 'item': {'id': item.id}}), 201
 
-# Toggle Active/Inactive Endpoint
 @app.route('/api/menu/toggle/<int:item_id>', methods=['PUT', 'OPTIONS'])
 @token_required
 def toggle_item_status(current_restaurant, item_id):
@@ -262,7 +257,6 @@ def update_delete_item(current_restaurant, item_id):
         db.session.commit()
         return jsonify({'success': True})
 
-# --- QR Code Generation ---
 @app.route('/api/generate-qr', methods=['POST', 'OPTIONS'])
 @token_required
 def generate_qr(current_restaurant):
@@ -270,8 +264,7 @@ def generate_qr(current_restaurant):
         return jsonify({'success': True}), 200
     
     try:
-        # FRONTEND_URL - Change this to your deployed frontend URL
-        FRONTEND_URL = "https://codewithahmed2005.github.io/ScanEats"  # CHANGE THIS
+        FRONTEND_URL = "https://codewithahmed2005.github.io/ScanEats"
         menu_url = f"{FRONTEND_URL}/menu.html?id={current_restaurant.id}"
         
         qr = qrcode.QRCode(version=1, box_size=10, border=4)
@@ -290,7 +283,6 @@ def generate_qr(current_restaurant):
     except Exception as e:
         return jsonify({'error': str(e)}), 500
 
-# --- Public Menu Route (Filters out inactive items) ---
 @app.route('/api/menu/<int:restaurant_id>', methods=['GET', 'OPTIONS'])
 def get_public_menu(restaurant_id):
     if request.method == 'OPTIONS':
@@ -319,7 +311,7 @@ def get_public_menu(restaurant_id):
 if __name__ == "__main__":
     with app.app_context():
         db.create_all()
-        print("✅ Database initialized!")
+        print("✅ Database tables created/verified successfully!")
 
     port = int(os.environ.get("PORT", 5000))
     app.run(host="0.0.0.0", port=port)
