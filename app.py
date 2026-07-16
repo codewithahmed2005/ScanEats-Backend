@@ -29,24 +29,14 @@ else:
 
 app.config['SQLALCHEMY_TRACK_MODIFICATIONS'] = False
 
-# --- CORS Setup (100% FIXED) ---
+# --- CORS Setup (SINGLE SOURCE - NO DUPLICATE) ---
 CORS(app, 
-     origins=["https://codewithahmed2005.github.io", "http://127.0.0.1:5500", "http://localhost:5500", "*"],
+     origins=["https://codewithahmed2005.github.io", "http://127.0.0.1:5500", "http://localhost:5500"],
      methods=["GET", "POST", "PUT", "DELETE", "OPTIONS"],
-     allow_headers=["Content-Type", "Authorization", "Accept", "Origin", "X-Requested-With"],
-     expose_headers=["Content-Type", "Authorization"],
-     supports_credentials=True,
-     max_age=3600)
+     allow_headers=["Content-Type", "Authorization", "Accept"],
+     supports_credentials=True)
 
-# --- After Request CORS Headers (Extra Safety) ---
-@app.after_request
-def after_request(response):
-    response.headers.add('Access-Control-Allow-Origin', '*')
-    response.headers.add('Access-Control-Allow-Headers', 'Content-Type, Authorization, Accept, Origin, X-Requested-With')
-    response.headers.add('Access-Control-Allow-Methods', 'GET, POST, PUT, DELETE, OPTIONS')
-    response.headers.add('Access-Control-Allow-Credentials', 'true')
-    response.headers.add('Access-Control-Max-Age', '3600')
-    return response
+# --- NO @app.after_request FOR CORS (AVOIDS DUPLICATE) ---
 
 db = SQLAlchemy(app)
 
@@ -103,11 +93,7 @@ def token_required(f):
 @app.route('/api/signup', methods=['POST', 'OPTIONS'])
 def signup():
     if request.method == 'OPTIONS':
-        response = jsonify({'success': True})
-        response.headers.add('Access-Control-Allow-Origin', '*')
-        response.headers.add('Access-Control-Allow-Headers', 'Content-Type, Authorization')
-        response.headers.add('Access-Control-Allow-Methods', 'POST, OPTIONS')
-        return response, 200
+        return jsonify({'success': True}), 200
     
     data = request.get_json()
     
@@ -141,11 +127,7 @@ def signup():
 @app.route('/api/login', methods=['POST', 'OPTIONS'])
 def login():
     if request.method == 'OPTIONS':
-        response = jsonify({'success': True})
-        response.headers.add('Access-Control-Allow-Origin', '*')
-        response.headers.add('Access-Control-Allow-Headers', 'Content-Type, Authorization')
-        response.headers.add('Access-Control-Allow-Methods', 'POST, OPTIONS')
-        return response, 200
+        return jsonify({'success': True}), 200
     
     data = request.get_json()
     restaurant = Restaurant.query.filter_by(email=data.get('email')).first()
@@ -172,11 +154,7 @@ def login():
 @token_required
 def get_me(current_restaurant):
     if request.method == 'OPTIONS':
-        response = jsonify({'success': True})
-        response.headers.add('Access-Control-Allow-Origin', '*')
-        response.headers.add('Access-Control-Allow-Headers', 'Content-Type, Authorization')
-        response.headers.add('Access-Control-Allow-Methods', 'GET, OPTIONS')
-        return response, 200
+        return jsonify({'success': True}), 200
     return jsonify({
         'id': current_restaurant.id,
         'restaurant_name': current_restaurant.restaurant_name,
@@ -189,11 +167,7 @@ def get_me(current_restaurant):
 @token_required
 def update_profile(current_restaurant):
     if request.method == 'OPTIONS':
-        response = jsonify({'success': True})
-        response.headers.add('Access-Control-Allow-Origin', '*')
-        response.headers.add('Access-Control-Allow-Headers', 'Content-Type, Authorization')
-        response.headers.add('Access-Control-Allow-Methods', 'PUT, OPTIONS')
-        return response, 200
+        return jsonify({'success': True}), 200
     
     data = request.get_json()
     if 'restaurant_name' in data: 
@@ -209,11 +183,7 @@ def update_profile(current_restaurant):
 @token_required
 def handle_menu_items(current_restaurant):
     if request.method == 'OPTIONS':
-        response = jsonify({'success': True})
-        response.headers.add('Access-Control-Allow-Origin', '*')
-        response.headers.add('Access-Control-Allow-Headers', 'Content-Type, Authorization')
-        response.headers.add('Access-Control-Allow-Methods', 'GET, POST, OPTIONS')
-        return response, 200
+        return jsonify({'success': True}), 200
     
     if request.method == 'GET':
         items = MenuItem.query.filter_by(restaurant_id=current_restaurant.id).all()
@@ -245,11 +215,7 @@ def handle_menu_items(current_restaurant):
 @token_required
 def toggle_item_status(current_restaurant, item_id):
     if request.method == 'OPTIONS':
-        response = jsonify({'success': True})
-        response.headers.add('Access-Control-Allow-Origin', '*')
-        response.headers.add('Access-Control-Allow-Headers', 'Content-Type, Authorization')
-        response.headers.add('Access-Control-Allow-Methods', 'PUT, OPTIONS')
-        return response, 200
+        return jsonify({'success': True}), 200
     
     item = MenuItem.query.filter_by(id=item_id, restaurant_id=current_restaurant.id).first()
     if not item:
@@ -263,11 +229,7 @@ def toggle_item_status(current_restaurant, item_id):
 @token_required
 def update_delete_item(current_restaurant, item_id):
     if request.method == 'OPTIONS':
-        response = jsonify({'success': True})
-        response.headers.add('Access-Control-Allow-Origin', '*')
-        response.headers.add('Access-Control-Allow-Headers', 'Content-Type, Authorization')
-        response.headers.add('Access-Control-Allow-Methods', 'PUT, DELETE, OPTIONS')
-        return response, 200
+        return jsonify({'success': True}), 200
     
     item = MenuItem.query.filter_by(id=item_id, restaurant_id=current_restaurant.id).first()
     if not item:
@@ -292,11 +254,7 @@ def update_delete_item(current_restaurant, item_id):
 @token_required
 def generate_qr(current_restaurant):
     if request.method == 'OPTIONS':
-        response = jsonify({'success': True})
-        response.headers.add('Access-Control-Allow-Origin', '*')
-        response.headers.add('Access-Control-Allow-Headers', 'Content-Type, Authorization')
-        response.headers.add('Access-Control-Allow-Methods', 'POST, OPTIONS')
-        return response, 200
+        return jsonify({'success': True}), 200
     
     try:
         FRONTEND_URL = "https://codewithahmed2005.github.io/ScanEats"
@@ -321,11 +279,7 @@ def generate_qr(current_restaurant):
 @app.route('/api/menu/<int:restaurant_id>', methods=['GET', 'OPTIONS'])
 def get_public_menu(restaurant_id):
     if request.method == 'OPTIONS':
-        response = jsonify({'success': True})
-        response.headers.add('Access-Control-Allow-Origin', '*')
-        response.headers.add('Access-Control-Allow-Headers', 'Content-Type, Authorization')
-        response.headers.add('Access-Control-Allow-Methods', 'GET, OPTIONS')
-        return response, 200
+        return jsonify({'success': True}), 200
     
     restaurant = Restaurant.query.get(restaurant_id)
     if not restaurant:
