@@ -47,6 +47,10 @@ def after_request(response):
 
 db = SQLAlchemy(app)
 
+with app.app_context():
+    db.create_all()
+    print("✅ Tables created successfully!")
+
 # --- Database Models ---
 class Restaurant(db.Model):
     id = db.Column(db.Integer, primary_key=True)
