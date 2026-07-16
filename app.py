@@ -29,11 +29,11 @@ else:
 
 app.config['SQLALCHEMY_TRACK_MODIFICATIONS'] = False
 
-# --- CORS Setup (SINGLE SOURCE - NO DUPLICATE) ---
+# --- CORS Setup (SIMPLE & WORKING) ---
 CORS(app, 
-     origins=["https://codewithahmed2005.github.io", "http://127.0.0.1:5500", "http://localhost:5500"],
+     origins=["https://codewithahmed2005.github.io", "http://127.0.0.1:5500"],
      methods=["GET", "POST", "PUT", "DELETE", "OPTIONS"],
-     allow_headers=["Content-Type", "Authorization", "Accept"],
+     allow_headers=["Content-Type", "Authorization"],
      supports_credentials=True)
 
 # --- NO @app.after_request FOR CORS (AVOIDS DUPLICATE) ---
