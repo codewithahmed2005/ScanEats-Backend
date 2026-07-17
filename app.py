@@ -27,18 +27,16 @@ else:
 app.config['SQLALCHEMY_TRACK_MODIFICATIONS'] = False
 
 # =====================================================================
-# CORS SETUP - SINGLE SOURCE OF TRUTH (NO DUPLICATE HEADERS)
+# CORS SETUP — ALLOW EVERYTHING (FIX)
 # =====================================================================
 CORS(app, 
-     origins=["https://codewithahmed2005.github.io", "http://127.0.0.1:5500", "http://localhost:5500"],
+     origins="*",
      methods=["GET", "POST", "PUT", "DELETE", "OPTIONS"],
      allow_headers=["Content-Type", "Authorization", "Accept"],
-     expose_headers=["Content-Type", "Authorization"],
-     supports_credentials=True,
-     max_age=3600)
+     supports_credentials=True)
 
 # =====================================================================
-# NO @app.after_request FOR CORS - AVOIDS DUPLICATE HEADERS
+# NO @app.after_request (Avoids duplicate headers)
 # =====================================================================
 
 db = SQLAlchemy(app)
