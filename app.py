@@ -277,13 +277,21 @@ def generate_qr(current_restaurant):
         FRONTEND_URL = "https://codewithahmed2005.github.io/ScanEats"
         menu_url = f"{FRONTEND_URL}/menu.html?id={current_restaurant.id}"
         
+        # Simple QR with try-except for format
         qr = qrcode.QRCode(version=1, box_size=10, border=4)
         qr.add_data(menu_url)
         qr.make(fit=True)
-        img = qr.make_image(fill_color='black', back_color='white')
+        
+        img = qr.make_image()
         
         buffered = BytesIO()
-        img.save(buffered, format="PNG")
+        # Try different save methods
+        try:
+            img.save(buffered, format='PNG')
+        except TypeError:
+            # Fallback: save without format parameter
+            img.save(buffered)
+        
         img_str = base64.b64encode(buffered.getvalue()).decode()
         
         return jsonify({
@@ -291,6 +299,7 @@ def generate_qr(current_restaurant):
             'qr_base64': f"data:image/png;base64,{img_str}"
         })
     except Exception as e:
+        print(f"QR Error: {str(e)}")
         return jsonify({'error': str(e)}), 500
 
 @app.route('/api/menu/<int:restaurant_id>', methods=['GET', 'OPTIONS'])
