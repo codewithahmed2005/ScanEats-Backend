@@ -27,17 +27,13 @@ else:
 app.config['SQLALCHEMY_TRACK_MODIFICATIONS'] = False
 
 # =====================================================================
-# CORS SETUP — ALLOW EVERYTHING (FIX)
+# CORS SETUP — ALLOW EVERYTHING
 # =====================================================================
 CORS(app, 
      origins="*",
      methods=["GET", "POST", "PUT", "DELETE", "OPTIONS"],
      allow_headers=["Content-Type", "Authorization", "Accept"],
      supports_credentials=True)
-
-# =====================================================================
-# NO @app.after_request (Avoids duplicate headers)
-# =====================================================================
 
 db = SQLAlchemy(app)
 
@@ -73,10 +69,16 @@ with app.app_context():
     db.create_all()
     print("✅ Database tables created/verified!")
 
-# --- Auth Decorator ---
+# =====================================================================
+# AUTH DECORATOR — FIXED FOR OPTIONS
+# =====================================================================
 def token_required(f):
     @wraps(f)
     def decorated(*args, **kwargs):
+        # --- FIX: Skip token check for OPTIONS requests ---
+        if request.method == 'OPTIONS':
+            return jsonify({'success': True}), 200
+        
         token = None
         if 'Authorization' in request.headers:
             token = request.headers['Authorization'].split(" ")[1]
@@ -162,8 +164,6 @@ def login():
 @app.route('/api/me', methods=['GET', 'OPTIONS'])
 @token_required
 def get_me(current_restaurant):
-    if request.method == 'OPTIONS':
-        return jsonify({'success': True}), 200
     return jsonify({
         'id': current_restaurant.id,
         'restaurant_name': current_restaurant.restaurant_name,
