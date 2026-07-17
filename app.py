@@ -13,13 +13,10 @@ from werkzeug.security import generate_password_hash, check_password_hash
 app = Flask(__name__)
 
 # --- Configuration ---
-app.config['SECRET_KEY'] = os.environ.get(
-    'SECRET_KEY',
-    'super-secret-scaneats-key-2024'
-)
+app.config['SECRET_KEY'] = os.environ.get('SECRET_KEY', 'super-secret-scaneats-key-2024')
 
+# --- Database Configuration ---
 DATABASE_URL = os.environ.get("DATABASE_URL")
-
 if DATABASE_URL:
     if DATABASE_URL.startswith("postgres://"):
         DATABASE_URL = DATABASE_URL.replace("postgres://", "postgresql://", 1)
@@ -29,14 +26,20 @@ else:
 
 app.config['SQLALCHEMY_TRACK_MODIFICATIONS'] = False
 
-# --- CORS Setup (SIMPLE & WORKING) ---
+# =====================================================================
+# CORS SETUP - SINGLE SOURCE OF TRUTH (NO DUPLICATE HEADERS)
+# =====================================================================
 CORS(app, 
-     origins=["https://codewithahmed2005.github.io", "http://127.0.0.1:5500"],
+     origins=["https://codewithahmed2005.github.io", "http://127.0.0.1:5500", "http://localhost:5500"],
      methods=["GET", "POST", "PUT", "DELETE", "OPTIONS"],
-     allow_headers=["Content-Type", "Authorization"],
-     supports_credentials=True)
+     allow_headers=["Content-Type", "Authorization", "Accept"],
+     expose_headers=["Content-Type", "Authorization"],
+     supports_credentials=True,
+     max_age=3600)
 
-# --- NO @app.after_request FOR CORS (AVOIDS DUPLICATE) ---
+# =====================================================================
+# NO @app.after_request FOR CORS - AVOIDS DUPLICATE HEADERS
+# =====================================================================
 
 db = SQLAlchemy(app)
 
@@ -67,7 +70,12 @@ class MenuItem(db.Model):
     is_veg = db.Column(db.Boolean, default=True)
     is_active = db.Column(db.Boolean, default=True)
 
-# --- Auth Decorator (JWT) ---
+# --- Create Tables ---
+with app.app_context():
+    db.create_all()
+    print("✅ Database tables created/verified!")
+
+# --- Auth Decorator ---
 def token_required(f):
     @wraps(f)
     def decorated(*args, **kwargs):
@@ -89,7 +97,10 @@ def token_required(f):
         return f(current_restaurant, *args, **kwargs)
     return decorated
 
-# --- Auth Routes ---
+# =====================================================================
+# AUTH ROUTES
+# =====================================================================
+
 @app.route('/api/signup', methods=['POST', 'OPTIONS'])
 def signup():
     if request.method == 'OPTIONS':
@@ -162,6 +173,10 @@ def get_me(current_restaurant):
         'upi_id': current_restaurant.upi_id,
         'logo_url': current_restaurant.logo_url
     })
+
+# =====================================================================
+# PROFILE & MENU ROUTES
+# =====================================================================
 
 @app.route('/api/profile', methods=['PUT', 'OPTIONS'])
 @token_required
@@ -250,6 +265,10 @@ def update_delete_item(current_restaurant, item_id):
         db.session.commit()
         return jsonify({'success': True})
 
+# =====================================================================
+# QR CODE & PUBLIC MENU
+# =====================================================================
+
 @app.route('/api/generate-qr', methods=['POST', 'OPTIONS'])
 @token_required
 def generate_qr(current_restaurant):
@@ -300,6 +319,10 @@ def get_public_menu(restaurant_id):
             'is_veg': i.is_veg
         } for i in items]
     })
+
+# =====================================================================
+# MAIN
+# =====================================================================
 
 if __name__ == "__main__":
     with app.app_context():
