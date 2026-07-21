@@ -10,6 +10,7 @@ from flask_sqlalchemy import SQLAlchemy
 from flask_cors import CORS
 from werkzeug.security import generate_password_hash, check_password_hash
 from datetime import datetime, timedelta
+from sqlalchemy import inspect, text
 
 app = Flask(__name__)
 
@@ -92,26 +93,34 @@ class MenuItem(db.Model):
     is_veg = db.Column(db.Boolean, default=True)
     is_active = db.Column(db.Boolean, default=True)
 
-# --- Create Tables with Migration ---
+# --- Create Tables with Migration (FIXED) ---
 with app.app_context():
     db.create_all()
     
     # Migration: Add new columns if they don't exist
     try:
-        # Check if columns exist, if not add them
-        from sqlalchemy import inspect
+        # Check if columns exist
         inspector = inspect(db.engine)
         columns = [col['name'] for col in inspector.get_columns('restaurant')]
         
+        # SQLite vs PostgreSQL compatibility
+        is_sqlite = 'sqlite' in str(db.engine.url)
+        
         if 'trial_start_date' not in columns:
             with db.engine.connect() as conn:
-                conn.execute(db.text('ALTER TABLE restaurant ADD COLUMN trial_start_date DATETIME'))
+                if is_sqlite:
+                    conn.execute(text('ALTER TABLE restaurant ADD COLUMN trial_start_date DATETIME'))
+                else:
+                    conn.execute(text('ALTER TABLE restaurant ADD COLUMN trial_start_date TIMESTAMP'))
                 conn.commit()
             print("✅ Added trial_start_date column")
             
         if 'is_subscribed' not in columns:
             with db.engine.connect() as conn:
-                conn.execute(db.text('ALTER TABLE restaurant ADD COLUMN is_subscribed BOOLEAN DEFAULT 0'))
+                if is_sqlite:
+                    conn.execute(text('ALTER TABLE restaurant ADD COLUMN is_subscribed BOOLEAN DEFAULT 0'))
+                else:
+                    conn.execute(text('ALTER TABLE restaurant ADD COLUMN is_subscribed BOOLEAN DEFAULT FALSE'))
                 conn.commit()
             print("✅ Added is_subscribed column")
             
