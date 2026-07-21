@@ -9,6 +9,7 @@ from flask import Flask, request, jsonify
 from flask_sqlalchemy import SQLAlchemy
 from flask_cors import CORS
 from werkzeug.security import generate_password_hash, check_password_hash
+from datetime import datetime, timedelta
 
 app = Flask(__name__)
 
@@ -46,6 +47,11 @@ class Restaurant(db.Model):
     password_hash = db.Column(db.String(255), nullable=False)
     upi_id = db.Column(db.String(50), nullable=True)
     logo_url = db.Column(db.String(255), nullable=True)
+    
+    # NEW: Trial & Subscription Fields
+    trial_start_date = db.Column(db.DateTime, nullable=True)
+    is_subscribed = db.Column(db.Boolean, default=False)
+    
     menu_items = db.relationship('MenuItem', backref='restaurant', lazy=True, cascade='all, delete-orphan')
 
     def set_password(self, password): 
@@ -53,6 +59,28 @@ class Restaurant(db.Model):
     
     def check_password(self, password): 
         return check_password_hash(self.password_hash, password)
+    
+    def get_trial_days_left(self):
+        """Calculate remaining trial days"""
+        if self.is_subscribed:
+            return None  # Unlimited if subscribed
+        
+        if not self.trial_start_date:
+            return 0
+            
+        today = datetime.utcnow()
+        trial_end = self.trial_start_date + timedelta(days=14)
+        days_left = (trial_end - today).days
+        
+        return max(0, days_left)
+    
+    def is_trial_expired(self):
+        """Check if trial is expired"""
+        if self.is_subscribed:
+            return False
+        
+        days_left = self.get_trial_days_left()
+        return days_left == 0
 
 class MenuItem(db.Model):
     id = db.Column(db.Integer, primary_key=True)
@@ -64,9 +92,41 @@ class MenuItem(db.Model):
     is_veg = db.Column(db.Boolean, default=True)
     is_active = db.Column(db.Boolean, default=True)
 
-# --- Create Tables ---
+# --- Create Tables with Migration ---
 with app.app_context():
     db.create_all()
+    
+    # Migration: Add new columns if they don't exist
+    try:
+        # Check if columns exist, if not add them
+        from sqlalchemy import inspect
+        inspector = inspect(db.engine)
+        columns = [col['name'] for col in inspector.get_columns('restaurant')]
+        
+        if 'trial_start_date' not in columns:
+            with db.engine.connect() as conn:
+                conn.execute(db.text('ALTER TABLE restaurant ADD COLUMN trial_start_date DATETIME'))
+                conn.commit()
+            print("✅ Added trial_start_date column")
+            
+        if 'is_subscribed' not in columns:
+            with db.engine.connect() as conn:
+                conn.execute(db.text('ALTER TABLE restaurant ADD COLUMN is_subscribed BOOLEAN DEFAULT 0'))
+                conn.commit()
+            print("✅ Added is_subscribed column")
+            
+        # Set trial_start_date for existing users (backdate by 7 days)
+        existing_restaurants = Restaurant.query.filter_by(trial_start_date=None).all()
+        if existing_restaurants:
+            for resto in existing_restaurants:
+                resto.trial_start_date = datetime.utcnow() - timedelta(days=7)
+                resto.is_subscribed = False
+            db.session.commit()
+            print(f"✅ Updated {len(existing_restaurants)} existing users with trial start date")
+            
+    except Exception as e:
+        print(f"⚠️ Migration note: {str(e)}")
+    
     print("✅ Database tables created/verified!")
 
 # =====================================================================
@@ -98,7 +158,7 @@ def token_required(f):
     return decorated
 
 # =====================================================================
-# AUTH ROUTES
+# AUTH ROUTES (Updated with Trial)
 # =====================================================================
 
 @app.route('/api/signup', methods=['POST', 'OPTIONS'])
@@ -114,7 +174,9 @@ def signup():
     restaurant = Restaurant(
         restaurant_name=data.get('restaurant_name'),
         owner_name=data.get('owner_name'),
-        email=data.get('email')
+        email=data.get('email'),
+        trial_start_date=datetime.utcnow(),  # NEW: Trial starts now
+        is_subscribed=False                   # NEW: Not subscribed yet
     )
     restaurant.set_password(data.get('password'))
     db.session.add(restaurant)
@@ -122,7 +184,7 @@ def signup():
     
     token = jwt.encode({
         'restaurant_id': restaurant.id,
-        'exp': datetime.datetime.utcnow() + datetime.timedelta(days=30)
+        'exp': datetime.utcnow() + timedelta(days=30)
     }, app.config['SECRET_KEY'], algorithm="HS256")
     
     return jsonify({
@@ -146,7 +208,7 @@ def login():
     if restaurant and restaurant.check_password(data.get('password')):
         token = jwt.encode({
             'restaurant_id': restaurant.id,
-            'exp': datetime.datetime.utcnow() + datetime.timedelta(days=30)
+            'exp': datetime.utcnow() + timedelta(days=30)
         }, app.config['SECRET_KEY'], algorithm="HS256")
         
         return jsonify({
@@ -164,16 +226,65 @@ def login():
 @app.route('/api/me', methods=['GET', 'OPTIONS'])
 @token_required
 def get_me(current_restaurant):
+    # Check if trial is expired
+    if not current_restaurant.is_subscribed:
+        days_left = current_restaurant.get_trial_days_left()
+        is_expired = current_restaurant.is_trial_expired()
+    else:
+        days_left = None
+        is_expired = False
+        
     return jsonify({
         'id': current_restaurant.id,
         'restaurant_name': current_restaurant.restaurant_name,
         'owner_name': current_restaurant.owner_name,
         'upi_id': current_restaurant.upi_id,
-        'logo_url': current_restaurant.logo_url
+        'logo_url': current_restaurant.logo_url,
+        'is_subscribed': current_restaurant.is_subscribed,
+        'trial_days_left': days_left,
+        'is_trial_expired': is_expired
     })
 
 # =====================================================================
-# PROFILE & MENU ROUTES
+# TRIAL & SUBSCRIPTION ROUTES (NEW)
+# =====================================================================
+
+@app.route('/api/trial-status', methods=['GET', 'OPTIONS'])
+@token_required
+def get_trial_status(current_restaurant):
+    if request.method == 'OPTIONS':
+        return jsonify({'success': True}), 200
+    
+    days_left = current_restaurant.get_trial_days_left()
+    is_expired = current_restaurant.is_trial_expired()
+    
+    return jsonify({
+        'success': True,
+        'trial_start_date': current_restaurant.trial_start_date.isoformat() if current_restaurant.trial_start_date else None,
+        'remaining_days': days_left,
+        'is_subscribed': current_restaurant.is_subscribed,
+        'is_expired': is_expired,
+        'trial_duration_days': 14
+    })
+
+@app.route('/api/subscribe', methods=['POST', 'OPTIONS'])
+@token_required
+def subscribe_restaurant(current_restaurant):
+    if request.method == 'OPTIONS':
+        return jsonify({'success': True}), 200
+    
+    # In production, integrate with payment gateway here
+    # For now, we'll just mark as subscribed
+    current_restaurant.is_subscribed = True
+    db.session.commit()
+    
+    return jsonify({
+        'success': True,
+        'message': 'Subscription activated successfully!'
+    })
+
+# =====================================================================
+# PROFILE & MENU ROUTES (Updated with Trial Check)
 # =====================================================================
 
 @app.route('/api/profile', methods=['PUT', 'OPTIONS'])
@@ -181,6 +292,10 @@ def get_me(current_restaurant):
 def update_profile(current_restaurant):
     if request.method == 'OPTIONS':
         return jsonify({'success': True}), 200
+    
+    # Check if trial expired (except for subscribed users)
+    if not current_restaurant.is_subscribed and current_restaurant.is_trial_expired():
+        return jsonify({'error': 'Trial expired. Please subscribe to continue.'}), 403
     
     data = request.get_json()
     if 'restaurant_name' in data: 
@@ -197,6 +312,12 @@ def update_profile(current_restaurant):
 def handle_menu_items(current_restaurant):
     if request.method == 'OPTIONS':
         return jsonify({'success': True}), 200
+    
+    # Check if trial expired (except for subscribed users)
+    if not current_restaurant.is_subscribed and current_restaurant.is_trial_expired():
+        if request.method == 'POST':
+            return jsonify({'error': 'Trial expired. Please subscribe to continue.'}), 403
+        # GET allowed even after expiry (view only)
     
     if request.method == 'GET':
         items = MenuItem.query.filter_by(restaurant_id=current_restaurant.id).all()
@@ -230,6 +351,10 @@ def toggle_item_status(current_restaurant, item_id):
     if request.method == 'OPTIONS':
         return jsonify({'success': True}), 200
     
+    # Check if trial expired (except for subscribed users)
+    if not current_restaurant.is_subscribed and current_restaurant.is_trial_expired():
+        return jsonify({'error': 'Trial expired. Please subscribe to continue.'}), 403
+    
     item = MenuItem.query.filter_by(id=item_id, restaurant_id=current_restaurant.id).first()
     if not item:
         return jsonify({'error': 'Item not found'}), 404
@@ -243,6 +368,10 @@ def toggle_item_status(current_restaurant, item_id):
 def update_delete_item(current_restaurant, item_id):
     if request.method == 'OPTIONS':
         return jsonify({'success': True}), 200
+    
+    # Check if trial expired (except for subscribed users)
+    if not current_restaurant.is_subscribed and current_restaurant.is_trial_expired():
+        return jsonify({'error': 'Trial expired. Please subscribe to continue.'}), 403
     
     item = MenuItem.query.filter_by(id=item_id, restaurant_id=current_restaurant.id).first()
     if not item:
@@ -277,7 +406,6 @@ def generate_qr(current_restaurant):
         FRONTEND_URL = "https://codewithahmed2005.github.io/ScanEats"
         menu_url = f"{FRONTEND_URL}/menu.html?id={current_restaurant.id}"
         
-        # Simple QR with try-except for format
         qr = qrcode.QRCode(version=1, box_size=10, border=4)
         qr.add_data(menu_url)
         qr.make(fit=True)
@@ -285,11 +413,9 @@ def generate_qr(current_restaurant):
         img = qr.make_image()
         
         buffered = BytesIO()
-        # Try different save methods
         try:
             img.save(buffered, format='PNG')
         except TypeError:
-            # Fallback: save without format parameter
             img.save(buffered)
         
         img_str = base64.b64encode(buffered.getvalue()).decode()
