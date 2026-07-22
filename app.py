@@ -49,7 +49,7 @@ class Restaurant(db.Model):
     upi_id = db.Column(db.String(50), nullable=True)
     logo_url = db.Column(db.String(255), nullable=True)
     
-    # NEW: Trial & Subscription Fields
+    # Trial & Subscription Fields
     trial_start_date = db.Column(db.DateTime, nullable=True)
     is_subscribed = db.Column(db.Boolean, default=False)
     
@@ -62,15 +62,18 @@ class Restaurant(db.Model):
         return check_password_hash(self.password_hash, password)
     
     def get_trial_days_left(self):
-        """Calculate remaining trial days"""
+        """Calculate remaining trial days (based on midnight)"""
         if self.is_subscribed:
             return None  # Unlimited if subscribed
         
         if not self.trial_start_date:
             return 0
             
-        today = datetime.utcnow()
+        # Get today at midnight (00:00)
+        today = datetime.utcnow().replace(hour=0, minute=0, second=0, microsecond=0)
         trial_end = self.trial_start_date + timedelta(days=14)
+        
+        # Calculate days left (trial ends at midnight on day 14)
         days_left = (trial_end - today).days
         
         return max(0, days_left)
@@ -93,13 +96,12 @@ class MenuItem(db.Model):
     is_veg = db.Column(db.Boolean, default=True)
     is_active = db.Column(db.Boolean, default=True)
 
-# --- Create Tables with Migration (FIXED) ---
+# --- Create Tables with Migration ---
 with app.app_context():
     db.create_all()
     
     # Migration: Add new columns if they don't exist
     try:
-        # Check if columns exist
         inspector = inspect(db.engine)
         columns = [col['name'] for col in inspector.get_columns('restaurant')]
         
@@ -124,14 +126,16 @@ with app.app_context():
                 conn.commit()
             print("✅ Added is_subscribed column")
             
-        # Set trial_start_date for existing users (backdate by 7 days)
+        # Set trial_start_date for existing users (backdate to midnight)
         existing_restaurants = Restaurant.query.filter_by(trial_start_date=None).all()
         if existing_restaurants:
+            # Get today at midnight
+            now = datetime.utcnow().replace(hour=0, minute=0, second=0, microsecond=0)
             for resto in existing_restaurants:
-                resto.trial_start_date = datetime.utcnow() - timedelta(days=7)
+                resto.trial_start_date = now - timedelta(days=7)  # 7 days backdated
                 resto.is_subscribed = False
             db.session.commit()
-            print(f"✅ Updated {len(existing_restaurants)} existing users with trial start date")
+            print(f"✅ Updated {len(existing_restaurants)} existing users with trial start date (midnight)")
             
     except Exception as e:
         print(f"⚠️ Migration note: {str(e)}")
@@ -167,7 +171,7 @@ def token_required(f):
     return decorated
 
 # =====================================================================
-# AUTH ROUTES (Updated with Trial)
+# AUTH ROUTES (Updated with Midnight Trial)
 # =====================================================================
 
 @app.route('/api/signup', methods=['POST', 'OPTIONS'])
@@ -179,13 +183,17 @@ def signup():
     
     if Restaurant.query.filter_by(email=data.get('email')).first():
         return jsonify({'error': 'Email already registered'}), 400
-        
+    
+    # Set trial start date to midnight (00:00)
+    now = datetime.utcnow()
+    trial_start = now.replace(hour=0, minute=0, second=0, microsecond=0)
+    
     restaurant = Restaurant(
         restaurant_name=data.get('restaurant_name'),
         owner_name=data.get('owner_name'),
         email=data.get('email'),
-        trial_start_date=datetime.utcnow(),  # NEW: Trial starts now
-        is_subscribed=False                   # NEW: Not subscribed yet
+        trial_start_date=trial_start,  # Midnight
+        is_subscribed=False
     )
     restaurant.set_password(data.get('password'))
     db.session.add(restaurant)
@@ -255,7 +263,7 @@ def get_me(current_restaurant):
     })
 
 # =====================================================================
-# TRIAL & SUBSCRIPTION ROUTES (NEW)
+# TRIAL & SUBSCRIPTION ROUTES
 # =====================================================================
 
 @app.route('/api/trial-status', methods=['GET', 'OPTIONS'])
@@ -283,7 +291,6 @@ def subscribe_restaurant(current_restaurant):
         return jsonify({'success': True}), 200
     
     # In production, integrate with payment gateway here
-    # For now, we'll just mark as subscribed
     current_restaurant.is_subscribed = True
     db.session.commit()
     
