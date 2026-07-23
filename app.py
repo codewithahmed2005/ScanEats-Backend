@@ -119,7 +119,7 @@ class MenuItem(db.Model):
     price = db.Column(db.Float, nullable=False)
     category = db.Column(db.String(50), nullable=False)
     is_veg = db.Column(db.Boolean, default=True)
-    is_active = db.Column(db.Boolean, default=True)  # ✅ Default True
+    is_active = db.Column(db.Boolean, default=True)
 
 # --- Create Tables with Migration ---
 with app.app_context():
@@ -256,8 +256,6 @@ def signup():
         'exp': datetime.utcnow() + timedelta(days=30)
     }, app.config['SECRET_KEY'], algorithm="HS256")
     
-    cache.delete_memoized(get_public_menu, restaurant.id)
-    
     return jsonify({
         'success': True, 
         'token': token,
@@ -346,15 +344,13 @@ def subscribe_restaurant(current_restaurant):
     current_restaurant.is_subscribed = True
     db.session.commit()
     
-    cache.delete_memoized(get_public_menu, current_restaurant.id)
-    
     return jsonify({
         'success': True,
         'message': 'Subscription activated successfully!'
     })
 
 # =====================================================================
-# PROFILE & MENU ROUTES (FIXED)
+# PROFILE & MENU ROUTES (FIXED - NO CACHE DELETE)
 # =====================================================================
 
 @app.route('/api/profile', methods=['PUT', 'OPTIONS'])
@@ -374,8 +370,6 @@ def update_profile(current_restaurant):
     if 'logo_url' in data: 
         current_restaurant.logo_url = data['logo_url']
     db.session.commit()
-    
-    cache.delete_memoized(get_public_menu, current_restaurant.id)
     
     return jsonify({'success': True})
 
@@ -404,7 +398,6 @@ def handle_menu_items(current_restaurant):
     elif request.method == 'POST':
         data = request.get_json()
         
-        # ✅ FIX: Ensure is_active is True
         item = MenuItem(
             restaurant_id=current_restaurant.id,
             name=data['name'],
@@ -412,13 +405,12 @@ def handle_menu_items(current_restaurant):
             price=float(data['price']),
             category=data['category'],
             is_veg=data.get('is_veg', True),
-            is_active=True  # ✅ EXPLICITLY SET TO TRUE
+            is_active=True
         )
         db.session.add(item)
         db.session.commit()
         
-        # ✅ FIX: Clear cache for this restaurant
-        cache.delete_memoized(get_public_menu, current_restaurant.id)
+        # ✅ NO CACHE DELETE (cache is disabled)
         
         return jsonify({'success': True, 'item': {'id': item.id}}), 201
 
@@ -437,9 +429,6 @@ def toggle_item_status(current_restaurant, item_id):
         
     item.is_active = not item.is_active
     db.session.commit()
-    
-    # Clear cache for this restaurant's public menu
-    cache.delete_memoized(get_public_menu, current_restaurant.id)
     
     return jsonify({'success': True, 'is_active': item.is_active})
 
@@ -463,20 +452,13 @@ def update_delete_item(current_restaurant, item_id):
         item.price = float(data['price'])
         item.category = data['category']
         item.is_veg = data.get('is_veg', True)
-        # ✅ Keep existing is_active value
         db.session.commit()
-        
-        # Clear cache for this restaurant's public menu
-        cache.delete_memoized(get_public_menu, current_restaurant.id)
         
         return jsonify({'success': True})
         
     elif request.method == 'DELETE':
         db.session.delete(item)
         db.session.commit()
-        
-        # Clear cache for this restaurant's public menu
-        cache.delete_memoized(get_public_menu, current_restaurant.id)
         
         return jsonify({'success': True})
 
@@ -494,7 +476,6 @@ def generate_qr(current_restaurant):
         FRONTEND_URL = "https://codewithahmed2005.github.io/ScanEats"
         menu_url = f"{FRONTEND_URL}/menu.html?id={current_restaurant.id}"
         
-        # HIGH RESOLUTION QR CODE — 1000x1000 px, 300 DPI
         qr = qrcode.QRCode(
             version=1,
             error_correction=qrcode.constants.ERROR_CORRECT_H,
@@ -527,11 +508,11 @@ def generate_qr(current_restaurant):
         return jsonify({'error': str(e)}), 500
 
 # =====================================================================
-# PUBLIC MENU (WITH CACHING)
+# PUBLIC MENU (CACHE DISABLED)
 # =====================================================================
 
 @app.route('/api/menu/<int:restaurant_id>', methods=['GET', 'OPTIONS'])
-# @cache.cached(timeout=300, query_string=True)
+# @cache.cached(timeout=300, query_string=True)  # DISABLED
 def get_public_menu(restaurant_id):
     if request.method == 'OPTIONS':
         return jsonify({'success': True}), 200
@@ -540,7 +521,6 @@ def get_public_menu(restaurant_id):
     if not restaurant:
         return jsonify({'error': 'Restaurant not found'}), 404
     
-    # ✅ Only show active items
     items = MenuItem.query.filter_by(
         restaurant_id=restaurant_id, 
         is_active=True
@@ -565,7 +545,7 @@ def get_public_menu(restaurant_id):
     return jsonify(response_data)
 
 # =====================================================================
-# DEBUG ENDPOINT (Temporary - Remove in Production)
+# DEBUG ENDPOINT
 # =====================================================================
 
 @app.route('/api/debug/menu/<int:restaurant_id>', methods=['GET', 'OPTIONS'])
@@ -579,22 +559,8 @@ def debug_menu(restaurant_id):
         'name': i.name,
         'is_active': i.is_active,
         'category': i.category,
-        'price': i.price,
-        'created_at': i.id  # Approximate
+        'price': i.price
     } for i in items])
-
-# =====================================================================
-# CACHE CLEAR ENDPOINT
-# =====================================================================
-
-@app.route('/api/cache/clear', methods=['POST', 'OPTIONS'])
-@token_required
-def clear_cache(current_restaurant):
-    if request.method == 'OPTIONS':
-        return jsonify({'success': True}), 200
-    
-    cache.clear()
-    return jsonify({'success': True, 'message': 'Cache cleared!'})
 
 # =====================================================================
 # MAIN
