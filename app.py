@@ -10,7 +10,11 @@ from flask_sqlalchemy import SQLAlchemy
 from flask_cors import CORS
 from werkzeug.security import generate_password_hash, check_password_hash
 from datetime import datetime, timedelta
-from sqlalchemy import inspect, text
+from sqlalchemy import inspect, text, Index
+
+# NEW: Caching & Compression
+from flask_caching import Cache
+from flask_compress import Compress
 
 app = Flask(__name__)
 
@@ -29,7 +33,26 @@ else:
 app.config['SQLALCHEMY_TRACK_MODIFICATIONS'] = False
 
 # =====================================================================
-# CORS SETUP — ALLOW EVERYTHING
+# CACHING CONFIG (NEW)
+# =====================================================================
+# Use Redis in production, Simple cache for development
+REDIS_URL = os.environ.get('REDIS_URL')
+if REDIS_URL:
+    app.config['CACHE_TYPE'] = 'RedisCache'
+    app.config['CACHE_REDIS_URL'] = REDIS_URL
+else:
+    app.config['CACHE_TYPE'] = 'SimpleCache'  # Fallback for development
+app.config['CACHE_DEFAULT_TIMEOUT'] = 300  # 5 minutes
+
+cache = Cache(app)
+
+# =====================================================================
+# COMPRESSION CONFIG (NEW)
+# =====================================================================
+Compress(app)
+
+# =====================================================================
+# CORS SETUP
 # =====================================================================
 CORS(app, 
      origins="*",
@@ -39,7 +62,7 @@ CORS(app,
 
 db = SQLAlchemy(app)
 
-# --- Database Models ---
+# --- Database Models with Indexing ---
 class Restaurant(db.Model):
     id = db.Column(db.Integer, primary_key=True)
     restaurant_name = db.Column(db.String(120), nullable=False)
@@ -62,31 +85,35 @@ class Restaurant(db.Model):
         return check_password_hash(self.password_hash, password)
     
     def get_trial_days_left(self):
-        """Calculate remaining trial days (based on midnight)"""
         if self.is_subscribed:
-            return None  # Unlimited if subscribed
-        
+            return None
         if not self.trial_start_date:
             return 0
-            
-        # Get today at midnight (00:00)
         today = datetime.utcnow().replace(hour=0, minute=0, second=0, microsecond=0)
         trial_end = self.trial_start_date + timedelta(days=14)
-        
-        # Calculate days left (trial ends at midnight on day 14)
         days_left = (trial_end - today).days
-        
         return max(0, days_left)
     
     def is_trial_expired(self):
-        """Check if trial is expired"""
         if self.is_subscribed:
             return False
-        
         days_left = self.get_trial_days_left()
         return days_left == 0
 
+
 class MenuItem(db.Model):
+    __tablename__ = 'menu_item'
+    
+    # =====================================================================
+    # DATABASE INDEXING (NEW)
+    # =====================================================================
+    __table_args__ = (
+        Index('idx_restaurant_active', 'restaurant_id', 'is_active'),  # Composite index for public menu queries
+        Index('idx_restaurant_id', 'restaurant_id'),                   # For restaurant-specific queries
+        Index('idx_is_active', 'is_active'),                           # For filtering active items
+        Index('idx_category', 'category'),                             # For category grouping
+    )
+    
     id = db.Column(db.Integer, primary_key=True)
     restaurant_id = db.Column(db.Integer, db.ForeignKey('restaurant.id'), nullable=False)
     name = db.Column(db.String(150), nullable=False)
@@ -104,8 +131,6 @@ with app.app_context():
     try:
         inspector = inspect(db.engine)
         columns = [col['name'] for col in inspector.get_columns('restaurant')]
-        
-        # SQLite vs PostgreSQL compatibility
         is_sqlite = 'sqlite' in str(db.engine.url)
         
         if 'trial_start_date' not in columns:
@@ -125,17 +150,54 @@ with app.app_context():
                     conn.execute(text('ALTER TABLE restaurant ADD COLUMN is_subscribed BOOLEAN DEFAULT FALSE'))
                 conn.commit()
             print("✅ Added is_subscribed column")
-            
+        
         # Set trial_start_date for existing users (backdate to midnight)
         existing_restaurants = Restaurant.query.filter_by(trial_start_date=None).all()
         if existing_restaurants:
-            # Get today at midnight
             now = datetime.utcnow().replace(hour=0, minute=0, second=0, microsecond=0)
             for resto in existing_restaurants:
-                resto.trial_start_date = now - timedelta(days=7)  # 7 days backdated
+                resto.trial_start_date = now - timedelta(days=7)
                 resto.is_subscribed = False
             db.session.commit()
             print(f"✅ Updated {len(existing_restaurants)} existing users with trial start date (midnight)")
+        
+        # =====================================================================
+        # CREATE INDEXES (NEW) - For PostgreSQL
+        # =====================================================================
+        if not is_sqlite:
+            with db.engine.connect() as conn:
+                # Check if indexes exist before creating
+                indexes = conn.execute(text("""
+                    SELECT indexname FROM pg_indexes 
+                    WHERE tablename = 'menu_item'
+                """)).fetchall()
+                index_names = [idx[0] for idx in indexes]
+                
+                if 'idx_restaurant_active' not in index_names:
+                    conn.execute(text("""
+                        CREATE INDEX idx_restaurant_active ON menu_item (restaurant_id, is_active)
+                    """))
+                    print("✅ Created index: idx_restaurant_active")
+                
+                if 'idx_restaurant_id' not in index_names:
+                    conn.execute(text("""
+                        CREATE INDEX idx_restaurant_id ON menu_item (restaurant_id)
+                    """))
+                    print("✅ Created index: idx_restaurant_id")
+                
+                if 'idx_is_active' not in index_names:
+                    conn.execute(text("""
+                        CREATE INDEX idx_is_active ON menu_item (is_active)
+                    """))
+                    print("✅ Created index: idx_is_active")
+                
+                if 'idx_category' not in index_names:
+                    conn.execute(text("""
+                        CREATE INDEX idx_category ON menu_item (category)
+                    """))
+                    print("✅ Created index: idx_category")
+                
+                conn.commit()
             
     except Exception as e:
         print(f"⚠️ Migration note: {str(e)}")
@@ -143,12 +205,11 @@ with app.app_context():
     print("✅ Database tables created/verified!")
 
 # =====================================================================
-# AUTH DECORATOR — FIXED FOR OPTIONS
+# AUTH DECORATOR
 # =====================================================================
 def token_required(f):
     @wraps(f)
     def decorated(*args, **kwargs):
-        # --- FIX: Skip token check for OPTIONS requests ---
         if request.method == 'OPTIONS':
             return jsonify({'success': True}), 200
         
@@ -171,7 +232,7 @@ def token_required(f):
     return decorated
 
 # =====================================================================
-# AUTH ROUTES (Updated with Midnight Trial)
+# AUTH ROUTES
 # =====================================================================
 
 @app.route('/api/signup', methods=['POST', 'OPTIONS'])
@@ -184,7 +245,7 @@ def signup():
     if Restaurant.query.filter_by(email=data.get('email')).first():
         return jsonify({'error': 'Email already registered'}), 400
     
-    # Set trial start date to midnight (00:00)
+    # Set trial start date to midnight
     now = datetime.utcnow()
     trial_start = now.replace(hour=0, minute=0, second=0, microsecond=0)
     
@@ -192,7 +253,7 @@ def signup():
         restaurant_name=data.get('restaurant_name'),
         owner_name=data.get('owner_name'),
         email=data.get('email'),
-        trial_start_date=trial_start,  # Midnight
+        trial_start_date=trial_start,
         is_subscribed=False
     )
     restaurant.set_password(data.get('password'))
@@ -203,6 +264,9 @@ def signup():
         'restaurant_id': restaurant.id,
         'exp': datetime.utcnow() + timedelta(days=30)
     }, app.config['SECRET_KEY'], algorithm="HS256")
+    
+    # Clear cache for new restaurant
+    cache.delete_memoized(get_public_menu, restaurant.id)
     
     return jsonify({
         'success': True, 
@@ -243,7 +307,6 @@ def login():
 @app.route('/api/me', methods=['GET', 'OPTIONS'])
 @token_required
 def get_me(current_restaurant):
-    # Check if trial is expired
     if not current_restaurant.is_subscribed:
         days_left = current_restaurant.get_trial_days_left()
         is_expired = current_restaurant.is_trial_expired()
@@ -290,9 +353,11 @@ def subscribe_restaurant(current_restaurant):
     if request.method == 'OPTIONS':
         return jsonify({'success': True}), 200
     
-    # In production, integrate with payment gateway here
     current_restaurant.is_subscribed = True
     db.session.commit()
+    
+    # Clear cache for this restaurant's public menu
+    cache.delete_memoized(get_public_menu, current_restaurant.id)
     
     return jsonify({
         'success': True,
@@ -300,7 +365,7 @@ def subscribe_restaurant(current_restaurant):
     })
 
 # =====================================================================
-# PROFILE & MENU ROUTES (Updated with Trial Check)
+# PROFILE & MENU ROUTES
 # =====================================================================
 
 @app.route('/api/profile', methods=['PUT', 'OPTIONS'])
@@ -309,7 +374,6 @@ def update_profile(current_restaurant):
     if request.method == 'OPTIONS':
         return jsonify({'success': True}), 200
     
-    # Check if trial expired (except for subscribed users)
     if not current_restaurant.is_subscribed and current_restaurant.is_trial_expired():
         return jsonify({'error': 'Trial expired. Please subscribe to continue.'}), 403
     
@@ -321,6 +385,10 @@ def update_profile(current_restaurant):
     if 'logo_url' in data: 
         current_restaurant.logo_url = data['logo_url']
     db.session.commit()
+    
+    # Clear cache for this restaurant's public menu
+    cache.delete_memoized(get_public_menu, current_restaurant.id)
+    
     return jsonify({'success': True})
 
 @app.route('/api/menu-items', methods=['GET', 'POST', 'OPTIONS'])
@@ -329,13 +397,12 @@ def handle_menu_items(current_restaurant):
     if request.method == 'OPTIONS':
         return jsonify({'success': True}), 200
     
-    # Check if trial expired (except for subscribed users)
     if not current_restaurant.is_subscribed and current_restaurant.is_trial_expired():
         if request.method == 'POST':
             return jsonify({'error': 'Trial expired. Please subscribe to continue.'}), 403
-        # GET allowed even after expiry (view only)
     
     if request.method == 'GET':
+        # Uses indexed query
         items = MenuItem.query.filter_by(restaurant_id=current_restaurant.id).all()
         return jsonify([{
             'id': i.id, 
@@ -359,6 +426,10 @@ def handle_menu_items(current_restaurant):
         )
         db.session.add(item)
         db.session.commit()
+        
+        # Clear cache for this restaurant's public menu
+        cache.delete_memoized(get_public_menu, current_restaurant.id)
+        
         return jsonify({'success': True, 'item': {'id': item.id}}), 201
 
 @app.route('/api/menu/toggle/<int:item_id>', methods=['PUT', 'OPTIONS'])
@@ -367,7 +438,6 @@ def toggle_item_status(current_restaurant, item_id):
     if request.method == 'OPTIONS':
         return jsonify({'success': True}), 200
     
-    # Check if trial expired (except for subscribed users)
     if not current_restaurant.is_subscribed and current_restaurant.is_trial_expired():
         return jsonify({'error': 'Trial expired. Please subscribe to continue.'}), 403
     
@@ -377,6 +447,10 @@ def toggle_item_status(current_restaurant, item_id):
         
     item.is_active = not item.is_active
     db.session.commit()
+    
+    # Clear cache for this restaurant's public menu
+    cache.delete_memoized(get_public_menu, current_restaurant.id)
+    
     return jsonify({'success': True, 'is_active': item.is_active})
 
 @app.route('/api/menu-items/<int:item_id>', methods=['PUT', 'DELETE', 'OPTIONS'])
@@ -385,7 +459,6 @@ def update_delete_item(current_restaurant, item_id):
     if request.method == 'OPTIONS':
         return jsonify({'success': True}), 200
     
-    # Check if trial expired (except for subscribed users)
     if not current_restaurant.is_subscribed and current_restaurant.is_trial_expired():
         return jsonify({'error': 'Trial expired. Please subscribe to continue.'}), 403
     
@@ -401,15 +474,23 @@ def update_delete_item(current_restaurant, item_id):
         item.category = data['category']
         item.is_veg = data.get('is_veg', True)
         db.session.commit()
+        
+        # Clear cache for this restaurant's public menu
+        cache.delete_memoized(get_public_menu, current_restaurant.id)
+        
         return jsonify({'success': True})
         
     elif request.method == 'DELETE':
         db.session.delete(item)
         db.session.commit()
+        
+        # Clear cache for this restaurant's public menu
+        cache.delete_memoized(get_public_menu, current_restaurant.id)
+        
         return jsonify({'success': True})
 
 # =====================================================================
-# QR CODE & PUBLIC MENU
+# QR CODE & PUBLIC MENU (WITH CACHING & COMPRESSION)
 # =====================================================================
 
 @app.route('/api/generate-qr', methods=['POST', 'OPTIONS'])
@@ -444,30 +525,56 @@ def generate_qr(current_restaurant):
         print(f"QR Error: {str(e)}")
         return jsonify({'error': str(e)}), 500
 
+
 @app.route('/api/menu/<int:restaurant_id>', methods=['GET', 'OPTIONS'])
+@cache.cached(timeout=300, query_string=True)  # NEW: Cache for 5 minutes
 def get_public_menu(restaurant_id):
     if request.method == 'OPTIONS':
         return jsonify({'success': True}), 200
     
+    # Uses indexed query for fast lookup
     restaurant = Restaurant.query.get(restaurant_id)
     if not restaurant:
         return jsonify({'error': 'Restaurant not found'}), 404
         
-    items = MenuItem.query.filter_by(restaurant_id=restaurant_id, is_active=True).order_by(MenuItem.category).all()
+    # Uses composite index (restaurant_id, is_active) for fast filtering
+    items = MenuItem.query.filter_by(
+        restaurant_id=restaurant_id, 
+        is_active=True
+    ).order_by(MenuItem.category).all()
     
-    return jsonify({
+    items_data = [{
+        'id': i.id, 
+        'name': i.name, 
+        'description': i.description,
+        'price': i.price, 
+        'category': i.category, 
+        'is_veg': i.is_veg
+    } for i in items]
+    
+    response_data = {
         'restaurant_name': restaurant.restaurant_name,
         'upi_id': restaurant.upi_id,
         'logo_url': restaurant.logo_url,
-        'items': [{
-            'id': i.id, 
-            'name': i.name, 
-            'description': i.description,
-            'price': i.price, 
-            'category': i.category, 
-            'is_veg': i.is_veg
-        } for i in items]
-    })
+        'items': items_data
+    }
+    
+    # Response will be automatically compressed by Flask-Compress
+    return jsonify(response_data)
+
+
+# =====================================================================
+# CACHE CLEAR ENDPOINT (For admin)
+# =====================================================================
+
+@app.route('/api/cache/clear', methods=['POST', 'OPTIONS'])
+@token_required
+def clear_cache(current_restaurant):
+    if request.method == 'OPTIONS':
+        return jsonify({'success': True}), 200
+    
+    cache.clear()
+    return jsonify({'success': True, 'message': 'Cache cleared!'})
 
 # =====================================================================
 # MAIN
