@@ -12,9 +12,12 @@ from werkzeug.security import generate_password_hash, check_password_hash
 from datetime import datetime, timedelta
 from sqlalchemy import inspect, text, Index
 
-# NEW: Caching & Compression
+# Caching & Compression
 from flask_caching import Cache
 from flask_compress import Compress
+
+# NEW: For high-res QR
+from PIL import Image
 
 app = Flask(__name__)
 
@@ -33,21 +36,20 @@ else:
 app.config['SQLALCHEMY_TRACK_MODIFICATIONS'] = False
 
 # =====================================================================
-# CACHING CONFIG (NEW)
+# CACHING CONFIG
 # =====================================================================
-# Use Redis in production, Simple cache for development
 REDIS_URL = os.environ.get('REDIS_URL')
 if REDIS_URL:
     app.config['CACHE_TYPE'] = 'RedisCache'
     app.config['CACHE_REDIS_URL'] = REDIS_URL
 else:
-    app.config['CACHE_TYPE'] = 'SimpleCache'  # Fallback for development
-app.config['CACHE_DEFAULT_TIMEOUT'] = 300  # 5 minutes
+    app.config['CACHE_TYPE'] = 'SimpleCache'
+app.config['CACHE_DEFAULT_TIMEOUT'] = 300
 
 cache = Cache(app)
 
 # =====================================================================
-# COMPRESSION CONFIG (NEW)
+# COMPRESSION CONFIG
 # =====================================================================
 Compress(app)
 
@@ -72,7 +74,6 @@ class Restaurant(db.Model):
     upi_id = db.Column(db.String(50), nullable=True)
     logo_url = db.Column(db.String(255), nullable=True)
     
-    # Trial & Subscription Fields
     trial_start_date = db.Column(db.DateTime, nullable=True)
     is_subscribed = db.Column(db.Boolean, default=False)
     
@@ -104,14 +105,11 @@ class Restaurant(db.Model):
 class MenuItem(db.Model):
     __tablename__ = 'menu_item'
     
-    # =====================================================================
-    # DATABASE INDEXING (NEW)
-    # =====================================================================
     __table_args__ = (
-        Index('idx_restaurant_active', 'restaurant_id', 'is_active'),  # Composite index for public menu queries
-        Index('idx_restaurant_id', 'restaurant_id'),                   # For restaurant-specific queries
-        Index('idx_is_active', 'is_active'),                           # For filtering active items
-        Index('idx_category', 'category'),                             # For category grouping
+        Index('idx_restaurant_active', 'restaurant_id', 'is_active'),
+        Index('idx_restaurant_id', 'restaurant_id'),
+        Index('idx_is_active', 'is_active'),
+        Index('idx_category', 'category'),
     )
     
     id = db.Column(db.Integer, primary_key=True)
@@ -127,7 +125,6 @@ class MenuItem(db.Model):
 with app.app_context():
     db.create_all()
     
-    # Migration: Add new columns if they don't exist
     try:
         inspector = inspect(db.engine)
         columns = [col['name'] for col in inspector.get_columns('restaurant')]
@@ -151,7 +148,6 @@ with app.app_context():
                 conn.commit()
             print("✅ Added is_subscribed column")
         
-        # Set trial_start_date for existing users (backdate to midnight)
         existing_restaurants = Restaurant.query.filter_by(trial_start_date=None).all()
         if existing_restaurants:
             now = datetime.utcnow().replace(hour=0, minute=0, second=0, microsecond=0)
@@ -161,12 +157,8 @@ with app.app_context():
             db.session.commit()
             print(f"✅ Updated {len(existing_restaurants)} existing users with trial start date (midnight)")
         
-        # =====================================================================
-        # CREATE INDEXES (NEW) - For PostgreSQL
-        # =====================================================================
         if not is_sqlite:
             with db.engine.connect() as conn:
-                # Check if indexes exist before creating
                 indexes = conn.execute(text("""
                     SELECT indexname FROM pg_indexes 
                     WHERE tablename = 'menu_item'
@@ -245,7 +237,6 @@ def signup():
     if Restaurant.query.filter_by(email=data.get('email')).first():
         return jsonify({'error': 'Email already registered'}), 400
     
-    # Set trial start date to midnight
     now = datetime.utcnow()
     trial_start = now.replace(hour=0, minute=0, second=0, microsecond=0)
     
@@ -265,7 +256,6 @@ def signup():
         'exp': datetime.utcnow() + timedelta(days=30)
     }, app.config['SECRET_KEY'], algorithm="HS256")
     
-    # Clear cache for new restaurant
     cache.delete_memoized(get_public_menu, restaurant.id)
     
     return jsonify({
@@ -356,7 +346,6 @@ def subscribe_restaurant(current_restaurant):
     current_restaurant.is_subscribed = True
     db.session.commit()
     
-    # Clear cache for this restaurant's public menu
     cache.delete_memoized(get_public_menu, current_restaurant.id)
     
     return jsonify({
@@ -386,7 +375,6 @@ def update_profile(current_restaurant):
         current_restaurant.logo_url = data['logo_url']
     db.session.commit()
     
-    # Clear cache for this restaurant's public menu
     cache.delete_memoized(get_public_menu, current_restaurant.id)
     
     return jsonify({'success': True})
@@ -402,7 +390,6 @@ def handle_menu_items(current_restaurant):
             return jsonify({'error': 'Trial expired. Please subscribe to continue.'}), 403
     
     if request.method == 'GET':
-        # Uses indexed query
         items = MenuItem.query.filter_by(restaurant_id=current_restaurant.id).all()
         return jsonify([{
             'id': i.id, 
@@ -427,7 +414,6 @@ def handle_menu_items(current_restaurant):
         db.session.add(item)
         db.session.commit()
         
-        # Clear cache for this restaurant's public menu
         cache.delete_memoized(get_public_menu, current_restaurant.id)
         
         return jsonify({'success': True, 'item': {'id': item.id}}), 201
@@ -448,7 +434,6 @@ def toggle_item_status(current_restaurant, item_id):
     item.is_active = not item.is_active
     db.session.commit()
     
-    # Clear cache for this restaurant's public menu
     cache.delete_memoized(get_public_menu, current_restaurant.id)
     
     return jsonify({'success': True, 'is_active': item.is_active})
@@ -475,7 +460,6 @@ def update_delete_item(current_restaurant, item_id):
         item.is_veg = data.get('is_veg', True)
         db.session.commit()
         
-        # Clear cache for this restaurant's public menu
         cache.delete_memoized(get_public_menu, current_restaurant.id)
         
         return jsonify({'success': True})
@@ -484,13 +468,12 @@ def update_delete_item(current_restaurant, item_id):
         db.session.delete(item)
         db.session.commit()
         
-        # Clear cache for this restaurant's public menu
         cache.delete_memoized(get_public_menu, current_restaurant.id)
         
         return jsonify({'success': True})
 
 # =====================================================================
-# QR CODE & PUBLIC MENU (WITH CACHING & COMPRESSION)
+# QR CODE GENERATION — HIGH RESOLUTION (FIXED)
 # =====================================================================
 
 @app.route('/api/generate-qr', methods=['POST', 'OPTIONS'])
@@ -503,41 +486,61 @@ def generate_qr(current_restaurant):
         FRONTEND_URL = "https://codewithahmed2005.github.io/ScanEats"
         menu_url = f"{FRONTEND_URL}/menu.html?id={current_restaurant.id}"
         
-        qr = qrcode.QRCode(version=1, box_size=10, border=4)
+        # =============================================================
+        # HIGH RESOLUTION QR CODE — 1000x1000 px, 300 DPI
+        # =============================================================
+        
+        # Step 1: Generate QR with high error correction
+        qr = qrcode.QRCode(
+            version=1,
+            error_correction=qrcode.constants.ERROR_CORRECT_H,  # Highest error correction
+            box_size=20,      # 2x of previous (10 → 20)
+            border=6          # 1.5x of previous (4 → 6)
+        )
         qr.add_data(menu_url)
         qr.make(fit=True)
         
-        img = qr.make_image()
+        # Step 2: Create image
+        img = qr.make_image(fill_color="black", back_color="white")
         
+        # Step 3: Resize to 1000x1000 with high quality
+        img = img.resize((1000, 1000), Image.Resampling.LANCZOS)
+        
+        # Step 4: Save as high-quality PNG with 300 DPI metadata
         buffered = BytesIO()
-        try:
-            img.save(buffered, format='PNG')
-        except TypeError:
-            img.save(buffered)
+        img.save(buffered, format='PNG', dpi=(300, 300), optimize=False)
+        buffered.seek(0)
         
+        # Step 5: Convert to Base64
         img_str = base64.b64encode(buffered.getvalue()).decode()
         
         return jsonify({
             'success': True,
-            'qr_base64': f"data:image/png;base64,{img_str}"
+            'qr_base64': f"data:image/png;base64,{img_str}",
+            'resolution': '1000x1000',
+            'format': 'PNG',
+            'dpi': 300,
+            'size_bytes': len(buffered.getvalue())
         })
+        
     except Exception as e:
         print(f"QR Error: {str(e)}")
         return jsonify({'error': str(e)}), 500
 
+# =====================================================================
+# PUBLIC MENU (WITH CACHING)
+# =====================================================================
 
 @app.route('/api/menu/<int:restaurant_id>', methods=['GET', 'OPTIONS'])
-@cache.cached(timeout=300, query_string=True)  # NEW: Cache for 5 minutes
+@cache.cached(timeout=300, query_string=True)
 def get_public_menu(restaurant_id):
     if request.method == 'OPTIONS':
         return jsonify({'success': True}), 200
     
-    # Uses indexed query for fast lookup
     restaurant = Restaurant.query.get(restaurant_id)
     if not restaurant:
         return jsonify({'error': 'Restaurant not found'}), 404
         
-    # Uses composite index (restaurant_id, is_active) for fast filtering
     items = MenuItem.query.filter_by(
         restaurant_id=restaurant_id, 
         is_active=True
@@ -559,12 +562,10 @@ def get_public_menu(restaurant_id):
         'items': items_data
     }
     
-    # Response will be automatically compressed by Flask-Compress
     return jsonify(response_data)
 
-
 # =====================================================================
-# CACHE CLEAR ENDPOINT (For admin)
+# CACHE CLEAR ENDPOINT
 # =====================================================================
 
 @app.route('/api/cache/clear', methods=['POST', 'OPTIONS'])
