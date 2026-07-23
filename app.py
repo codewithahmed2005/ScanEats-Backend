@@ -16,12 +16,28 @@ from sqlalchemy import inspect, text, Index
 from flask_caching import Cache
 from flask_compress import Compress
 
+# NEW: Rate Limiting
+from flask_limiter import Limiter
+from flask_limiter.util import get_remote_address
+
 # For high-res QR
 from PIL import Image
 
 app = Flask(__name__)
 
-# --- Configuration ---
+# =====================================================================
+# RATE LIMITER CONFIG (NEW)
+# =====================================================================
+limiter = Limiter(
+    app=app,
+    key_func=get_remote_address,  # Track by IP address
+    default_limits=["200 per day", "50 per hour"],  # Global defaults
+    storage_uri="memory://",  # Use Redis in production: redis://localhost:6379
+)
+
+# =====================================================================
+# CONFIGURATION
+# =====================================================================
 app.config['SECRET_KEY'] = os.environ.get('SECRET_KEY', 'super-secret-scaneats-key-2024')
 
 # --- Database Configuration ---
@@ -64,7 +80,7 @@ CORS(app,
 
 db = SQLAlchemy(app)
 
-# --- Database Models with Indexing ---
+# --- Database Models ---
 class Restaurant(db.Model):
     id = db.Column(db.Integer, primary_key=True)
     restaurant_name = db.Column(db.String(120), nullable=False)
@@ -228,6 +244,7 @@ def token_required(f):
 # =====================================================================
 
 @app.route('/api/signup', methods=['POST', 'OPTIONS'])
+@limiter.limit("5 per minute")  # NEW: Prevent spam signups
 def signup():
     if request.method == 'OPTIONS':
         return jsonify({'success': True}), 200
@@ -267,6 +284,7 @@ def signup():
     }), 201
 
 @app.route('/api/login', methods=['POST', 'OPTIONS'])
+@limiter.limit("10 per minute")  # NEW: Prevent brute force
 def login():
     if request.method == 'OPTIONS':
         return jsonify({'success': True}), 200
@@ -350,11 +368,12 @@ def subscribe_restaurant(current_restaurant):
     })
 
 # =====================================================================
-# PROFILE & MENU ROUTES (FIXED - NO CACHE DELETE)
+# PROFILE & MENU ROUTES (with rate limits for protected endpoints)
 # =====================================================================
 
 @app.route('/api/profile', methods=['PUT', 'OPTIONS'])
 @token_required
+@limiter.limit("10 per minute")  # NEW
 def update_profile(current_restaurant):
     if request.method == 'OPTIONS':
         return jsonify({'success': True}), 200
@@ -375,6 +394,7 @@ def update_profile(current_restaurant):
 
 @app.route('/api/menu-items', methods=['GET', 'POST', 'OPTIONS'])
 @token_required
+@limiter.limit("30 per minute")  # NEW: Prevent spam
 def handle_menu_items(current_restaurant):
     if request.method == 'OPTIONS':
         return jsonify({'success': True}), 200
@@ -410,12 +430,11 @@ def handle_menu_items(current_restaurant):
         db.session.add(item)
         db.session.commit()
         
-        # ✅ NO CACHE DELETE (cache is disabled)
-        
         return jsonify({'success': True, 'item': {'id': item.id}}), 201
 
 @app.route('/api/menu/toggle/<int:item_id>', methods=['PUT', 'OPTIONS'])
 @token_required
+@limiter.limit("20 per minute")
 def toggle_item_status(current_restaurant, item_id):
     if request.method == 'OPTIONS':
         return jsonify({'success': True}), 200
@@ -434,6 +453,7 @@ def toggle_item_status(current_restaurant, item_id):
 
 @app.route('/api/menu-items/<int:item_id>', methods=['PUT', 'DELETE', 'OPTIONS'])
 @token_required
+@limiter.limit("20 per minute")
 def update_delete_item(current_restaurant, item_id):
     if request.method == 'OPTIONS':
         return jsonify({'success': True}), 200
@@ -463,11 +483,12 @@ def update_delete_item(current_restaurant, item_id):
         return jsonify({'success': True})
 
 # =====================================================================
-# QR CODE GENERATION — HIGH RESOLUTION
+# QR CODE GENERATION
 # =====================================================================
 
 @app.route('/api/generate-qr', methods=['POST', 'OPTIONS'])
 @token_required
+@limiter.limit("10 per minute")  # NEW: Prevent QR spam
 def generate_qr(current_restaurant):
     if request.method == 'OPTIONS':
         return jsonify({'success': True}), 200
@@ -508,11 +529,11 @@ def generate_qr(current_restaurant):
         return jsonify({'error': str(e)}), 500
 
 # =====================================================================
-# PUBLIC MENU (CACHE DISABLED)
+# PUBLIC MENU (WITH RATE LIMITING - MOST IMPORTANT)
 # =====================================================================
 
 @app.route('/api/menu/<int:restaurant_id>', methods=['GET', 'OPTIONS'])
-# @cache.cached(timeout=300, query_string=True)  # DISABLED
+@limiter.limit("100 per minute")  # ✅ NEW: Max 100 requests per IP per minute
 def get_public_menu(restaurant_id):
     if request.method == 'OPTIONS':
         return jsonify({'success': True}), 200
@@ -545,10 +566,11 @@ def get_public_menu(restaurant_id):
     return jsonify(response_data)
 
 # =====================================================================
-# DEBUG ENDPOINT
+# DEBUG ENDPOINT (with rate limit)
 # =====================================================================
 
 @app.route('/api/debug/menu/<int:restaurant_id>', methods=['GET', 'OPTIONS'])
+@limiter.limit("10 per minute")  # NEW
 def debug_menu(restaurant_id):
     if request.method == 'OPTIONS':
         return jsonify({'success': True}), 200
