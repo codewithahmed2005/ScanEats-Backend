@@ -531,7 +531,7 @@ def generate_qr(current_restaurant):
 # =====================================================================
 
 @app.route('/api/menu/<int:restaurant_id>', methods=['GET', 'OPTIONS'])
-@cache.cached(timeout=300, query_string=True)
+# @cache.cached(timeout=300, query_string=True)
 def get_public_menu(restaurant_id):
     if request.method == 'OPTIONS':
         return jsonify({'success': True}), 200
