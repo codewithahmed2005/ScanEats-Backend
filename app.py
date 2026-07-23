@@ -16,7 +16,7 @@ from sqlalchemy import inspect, text, Index
 from flask_caching import Cache
 from flask_compress import Compress
 
-# NEW: For high-res QR
+# For high-res QR
 from PIL import Image
 
 app = Flask(__name__)
@@ -119,7 +119,7 @@ class MenuItem(db.Model):
     price = db.Column(db.Float, nullable=False)
     category = db.Column(db.String(50), nullable=False)
     is_veg = db.Column(db.Boolean, default=True)
-    is_active = db.Column(db.Boolean, default=True)
+    is_active = db.Column(db.Boolean, default=True)  # ✅ Default True
 
 # --- Create Tables with Migration ---
 with app.app_context():
@@ -354,7 +354,7 @@ def subscribe_restaurant(current_restaurant):
     })
 
 # =====================================================================
-# PROFILE & MENU ROUTES
+# PROFILE & MENU ROUTES (FIXED)
 # =====================================================================
 
 @app.route('/api/profile', methods=['PUT', 'OPTIONS'])
@@ -403,17 +403,21 @@ def handle_menu_items(current_restaurant):
         
     elif request.method == 'POST':
         data = request.get_json()
+        
+        # ✅ FIX: Ensure is_active is True
         item = MenuItem(
             restaurant_id=current_restaurant.id,
             name=data['name'],
             description=data.get('description', ''),
             price=float(data['price']),
             category=data['category'],
-            is_veg=data.get('is_veg', True)
+            is_veg=data.get('is_veg', True),
+            is_active=True  # ✅ EXPLICITLY SET TO TRUE
         )
         db.session.add(item)
         db.session.commit()
         
+        # ✅ FIX: Clear cache for this restaurant
         cache.delete_memoized(get_public_menu, current_restaurant.id)
         
         return jsonify({'success': True, 'item': {'id': item.id}}), 201
@@ -434,6 +438,7 @@ def toggle_item_status(current_restaurant, item_id):
     item.is_active = not item.is_active
     db.session.commit()
     
+    # Clear cache for this restaurant's public menu
     cache.delete_memoized(get_public_menu, current_restaurant.id)
     
     return jsonify({'success': True, 'is_active': item.is_active})
@@ -458,8 +463,10 @@ def update_delete_item(current_restaurant, item_id):
         item.price = float(data['price'])
         item.category = data['category']
         item.is_veg = data.get('is_veg', True)
+        # ✅ Keep existing is_active value
         db.session.commit()
         
+        # Clear cache for this restaurant's public menu
         cache.delete_memoized(get_public_menu, current_restaurant.id)
         
         return jsonify({'success': True})
@@ -468,12 +475,13 @@ def update_delete_item(current_restaurant, item_id):
         db.session.delete(item)
         db.session.commit()
         
+        # Clear cache for this restaurant's public menu
         cache.delete_memoized(get_public_menu, current_restaurant.id)
         
         return jsonify({'success': True})
 
 # =====================================================================
-# QR CODE GENERATION — HIGH RESOLUTION (FIXED)
+# QR CODE GENERATION — HIGH RESOLUTION
 # =====================================================================
 
 @app.route('/api/generate-qr', methods=['POST', 'OPTIONS'])
@@ -486,32 +494,23 @@ def generate_qr(current_restaurant):
         FRONTEND_URL = "https://codewithahmed2005.github.io/ScanEats"
         menu_url = f"{FRONTEND_URL}/menu.html?id={current_restaurant.id}"
         
-        # =============================================================
         # HIGH RESOLUTION QR CODE — 1000x1000 px, 300 DPI
-        # =============================================================
-        
-        # Step 1: Generate QR with high error correction
         qr = qrcode.QRCode(
             version=1,
-            error_correction=qrcode.constants.ERROR_CORRECT_H,  # Highest error correction
-            box_size=20,      # 2x of previous (10 → 20)
-            border=6          # 1.5x of previous (4 → 6)
+            error_correction=qrcode.constants.ERROR_CORRECT_H,
+            box_size=20,
+            border=6
         )
         qr.add_data(menu_url)
         qr.make(fit=True)
         
-        # Step 2: Create image
         img = qr.make_image(fill_color="black", back_color="white")
-        
-        # Step 3: Resize to 1000x1000 with high quality
         img = img.resize((1000, 1000), Image.Resampling.LANCZOS)
         
-        # Step 4: Save as high-quality PNG with 300 DPI metadata
         buffered = BytesIO()
         img.save(buffered, format='PNG', dpi=(300, 300), optimize=False)
         buffered.seek(0)
         
-        # Step 5: Convert to Base64
         img_str = base64.b64encode(buffered.getvalue()).decode()
         
         return jsonify({
@@ -540,7 +539,8 @@ def get_public_menu(restaurant_id):
     restaurant = Restaurant.query.get(restaurant_id)
     if not restaurant:
         return jsonify({'error': 'Restaurant not found'}), 404
-        
+    
+    # ✅ Only show active items
     items = MenuItem.query.filter_by(
         restaurant_id=restaurant_id, 
         is_active=True
@@ -563,6 +563,25 @@ def get_public_menu(restaurant_id):
     }
     
     return jsonify(response_data)
+
+# =====================================================================
+# DEBUG ENDPOINT (Temporary - Remove in Production)
+# =====================================================================
+
+@app.route('/api/debug/menu/<int:restaurant_id>', methods=['GET', 'OPTIONS'])
+def debug_menu(restaurant_id):
+    if request.method == 'OPTIONS':
+        return jsonify({'success': True}), 200
+    
+    items = MenuItem.query.filter_by(restaurant_id=restaurant_id).all()
+    return jsonify([{
+        'id': i.id,
+        'name': i.name,
+        'is_active': i.is_active,
+        'category': i.category,
+        'price': i.price,
+        'created_at': i.id  # Approximate
+    } for i in items])
 
 # =====================================================================
 # CACHE CLEAR ENDPOINT
