@@ -5,40 +5,45 @@ import jwt
 import datetime
 from io import BytesIO
 from functools import wraps
-from flask import Flask, request, jsonify
+from flask import Flask, request, jsonify, redirect, session, url_for
 from flask_sqlalchemy import SQLAlchemy
 from flask_cors import CORS
 from werkzeug.security import generate_password_hash, check_password_hash
 from datetime import datetime, timedelta
 from sqlalchemy import inspect, text, Index
 
+# =====================================================================
+# NEW: Google OAuth
+# =====================================================================
+import requests
+from google.oauth2 import id_token
+from google.auth.transport import requests as google_requests
+
 # Caching & Compression
 from flask_caching import Cache
 from flask_compress import Compress
-
-# NEW: Rate Limiting
-from flask_limiter import Limiter
-from flask_limiter.util import get_remote_address
 
 # For high-res QR
 from PIL import Image
 
 app = Flask(__name__)
 
-# =====================================================================
-# RATE LIMITER CONFIG (NEW)
-# =====================================================================
-limiter = Limiter(
-    app=app,
-    key_func=get_remote_address,  # Track by IP address
-    default_limits=["200 per day", "50 per hour"],  # Global defaults
-    storage_uri="memory://",  # Use Redis in production: redis://localhost:6379
-)
+# --- Configuration ---
+app.config['SECRET_KEY'] = os.environ.get('SECRET_KEY', 'super-secret-scaneats-key-2024')
+app.config['SESSION_COOKIE_SECURE'] = True
+app.config['SESSION_COOKIE_SAMESITE'] = 'Lax'
 
 # =====================================================================
-# CONFIGURATION
+# GOOGLE OATH CONFIG (NEW)
 # =====================================================================
-app.config['SECRET_KEY'] = os.environ.get('SECRET_KEY', 'super-secret-scaneats-key-2024')
+GOOGLE_CLIENT_ID = os.environ.get('GOOGLE_CLIENT_ID')
+GOOGLE_CLIENT_SECRET = os.environ.get('GOOGLE_CLIENT_SECRET')
+APP_BASE_URL = os.environ.get('APP_BASE_URL', 'http://localhost:5000')
+
+# Google OAuth URLs
+GOOGLE_AUTH_URL = "https://accounts.google.com/o/oauth2/auth"
+GOOGLE_TOKEN_URL = "https://oauth2.googleapis.com/token"
+GOOGLE_USERINFO_URL = "https://www.googleapis.com/oauth2/v2/userinfo"
 
 # --- Database Configuration ---
 DATABASE_URL = os.environ.get("DATABASE_URL")
@@ -70,10 +75,10 @@ cache = Cache(app)
 Compress(app)
 
 # =====================================================================
-# CORS SETUP
+# CORS SETUP (Updated for OAuth)
 # =====================================================================
-CORS(app, 
-     origins="*",
+CORS(app,
+     origins=[APP_BASE_URL, "https://codewithahmed2005.github.io", "http://localhost:5500", "http://127.0.0.1:5500"],
      methods=["GET", "POST", "PUT", "DELETE", "OPTIONS"],
      allow_headers=["Content-Type", "Authorization", "Accept"],
      supports_credentials=True)
@@ -83,12 +88,17 @@ db = SQLAlchemy(app)
 # --- Database Models ---
 class Restaurant(db.Model):
     id = db.Column(db.Integer, primary_key=True)
-    restaurant_name = db.Column(db.String(120), nullable=False)
-    owner_name = db.Column(db.String(120), nullable=False)
+    restaurant_name = db.Column(db.String(120), nullable=True)
+    owner_name = db.Column(db.String(120), nullable=True)
     email = db.Column(db.String(120), unique=True, nullable=False)
-    password_hash = db.Column(db.String(255), nullable=False)
+    password_hash = db.Column(db.String(255), nullable=True)
     upi_id = db.Column(db.String(50), nullable=True)
     logo_url = db.Column(db.String(255), nullable=True)
+    
+    # NEW: Google OAuth Fields
+    google_id = db.Column(db.String(255), unique=True, nullable=True)
+    profile_picture = db.Column(db.String(500), nullable=True)
+    is_google_user = db.Column(db.Boolean, default=False)
     
     trial_start_date = db.Column(db.DateTime, nullable=True)
     is_subscribed = db.Column(db.Boolean, default=False)
@@ -99,6 +109,8 @@ class Restaurant(db.Model):
         self.password_hash = generate_password_hash(password)
     
     def check_password(self, password): 
+        if not self.password_hash:
+            return False
         return check_password_hash(self.password_hash, password)
     
     def get_trial_days_left(self):
@@ -145,6 +157,20 @@ with app.app_context():
         inspector = inspect(db.engine)
         columns = [col['name'] for col in inspector.get_columns('restaurant')]
         is_sqlite = 'sqlite' in str(db.engine.url)
+        
+        # Add new columns for Google OAuth
+        if 'google_id' not in columns:
+            with db.engine.connect() as conn:
+                if is_sqlite:
+                    conn.execute(text('ALTER TABLE restaurant ADD COLUMN google_id VARCHAR(255)'))
+                    conn.execute(text('ALTER TABLE restaurant ADD COLUMN profile_picture VARCHAR(500)'))
+                    conn.execute(text('ALTER TABLE restaurant ADD COLUMN is_google_user BOOLEAN DEFAULT 0'))
+                else:
+                    conn.execute(text('ALTER TABLE restaurant ADD COLUMN google_id VARCHAR(255)'))
+                    conn.execute(text('ALTER TABLE restaurant ADD COLUMN profile_picture VARCHAR(500)'))
+                    conn.execute(text('ALTER TABLE restaurant ADD COLUMN is_google_user BOOLEAN DEFAULT FALSE'))
+                conn.commit()
+            print("✅ Added Google OAuth columns")
         
         if 'trial_start_date' not in columns:
             with db.engine.connect() as conn:
@@ -240,11 +266,157 @@ def token_required(f):
     return decorated
 
 # =====================================================================
-# AUTH ROUTES
+# GOOGLE OATH ROUTES (NEW)
+# =====================================================================
+
+@app.route('/api/auth/google', methods=['GET'])
+def google_login():
+    """Redirect user to Google OAuth consent screen"""
+    try:
+        # Build Google OAuth URL
+        redirect_uri = f"{APP_BASE_URL}/api/auth/google/callback"
+        
+        params = {
+            'client_id': GOOGLE_CLIENT_ID,
+            'redirect_uri': redirect_uri,
+            'response_type': 'code',
+            'scope': 'email profile',
+            'access_type': 'offline',
+            'prompt': 'select_account'
+        }
+        
+        auth_url = f"{GOOGLE_AUTH_URL}?{requests.compat.urlencode(params)}"
+        return redirect(auth_url)
+        
+    except Exception as e:
+        print(f"Google Auth Error: {str(e)}")
+        return redirect(f"{APP_BASE_URL}/auth.html?error=google_auth_failed")
+
+
+@app.route('/api/auth/google/callback', methods=['GET'])
+def google_callback():
+    """Handle Google OAuth callback"""
+    try:
+        # Get authorization code from Google
+        code = request.args.get('code')
+        error = request.args.get('error')
+        
+        if error:
+            return redirect(f"{APP_BASE_URL}/auth.html?error=google_auth_failed")
+        
+        if not code:
+            return redirect(f"{APP_BASE_URL}/auth.html?error=no_code")
+        
+        # Exchange code for access token
+        redirect_uri = f"{APP_BASE_URL}/api/auth/google/callback"
+        
+        token_data = {
+            'code': code,
+            'client_id': GOOGLE_CLIENT_ID,
+            'client_secret': GOOGLE_CLIENT_SECRET,
+            'redirect_uri': redirect_uri,
+            'grant_type': 'authorization_code'
+        }
+        
+        token_response = requests.post(GOOGLE_TOKEN_URL, data=token_data)
+        token_json = token_response.json()
+        
+        if 'access_token' not in token_json:
+            print(f"Token error: {token_json}")
+            return redirect(f"{APP_BASE_URL}/auth.html?error=token_failed")
+        
+        access_token = token_json['access_token']
+        
+        # Get user info from Google
+        userinfo_response = requests.get(
+            GOOGLE_USERINFO_URL,
+            headers={'Authorization': f'Bearer {access_token}'}
+        )
+        userinfo = userinfo_response.json()
+        
+        if 'email' not in userinfo:
+            return redirect(f"{APP_BASE_URL}/auth.html?error=no_email")
+        
+        email = userinfo['email']
+        name = userinfo.get('name', '')
+        google_id = userinfo.get('id', '')
+        profile_picture = userinfo.get('picture', '')
+        
+        # =============================================================
+        # CHECK IF USER EXISTS
+        # =============================================================
+        user = Restaurant.query.filter_by(email=email).first()
+        
+        if user:
+            # Existing user - check if Google linked
+            if not user.is_google_user:
+                # Link Google account to existing user
+                user.google_id = google_id
+                user.is_google_user = True
+                user.profile_picture = profile_picture
+                if not user.owner_name and name:
+                    user.owner_name = name
+                db.session.commit()
+            
+            # Update trial if not set
+            if not user.trial_start_date:
+                now = datetime.utcnow().replace(hour=0, minute=0, second=0, microsecond=0)
+                user.trial_start_date = now
+                db.session.commit()
+            
+        else:
+            # NEW USER - Auto register with Google
+            now = datetime.utcnow().replace(hour=0, minute=0, second=0, microsecond=0)
+            
+            # Extract restaurant name from email or use default
+            restaurant_name = email.split('@')[0].replace('.', ' ').title()
+            if not restaurant_name:
+                restaurant_name = "My Restaurant"
+            
+            user = Restaurant(
+                email=email,
+                owner_name=name or restaurant_name,
+                restaurant_name=f"{restaurant_name}'s Cafe",
+                google_id=google_id,
+                is_google_user=True,
+                profile_picture=profile_picture,
+                trial_start_date=now,
+                is_subscribed=False
+            )
+            db.session.add(user)
+            db.session.commit()
+        
+        # =============================================================
+        # GENERATE JWT TOKEN
+        # =============================================================
+        token = jwt.encode({
+            'restaurant_id': user.id,
+            'exp': datetime.utcnow() + timedelta(days=30)
+        }, app.config['SECRET_KEY'], algorithm="HS256")
+        
+        # Redirect to frontend with token
+        frontend_url = os.environ.get('FRONTEND_URL', 'https://codewithahmed2005.github.io/ScanEats')
+        return redirect(f"{frontend_url}/auth.html?token={token}&google_auth=success")
+        
+    except Exception as e:
+        print(f"Google Callback Error: {str(e)}")
+        return redirect(f"{APP_BASE_URL}/auth.html?error=google_auth_failed")
+
+
+@app.route('/api/auth/google/status', methods=['GET'])
+def google_auth_status():
+    """Check if Google OAuth is configured"""
+    has_google_config = bool(GOOGLE_CLIENT_ID and GOOGLE_CLIENT_SECRET)
+    return jsonify({
+        'configured': has_google_config,
+        'client_id': GOOGLE_CLIENT_ID[:10] + '...' if GOOGLE_CLIENT_ID else None
+    })
+
+# =====================================================================
+# AUTH ROUTES (Updated)
 # =====================================================================
 
 @app.route('/api/signup', methods=['POST', 'OPTIONS'])
-@limiter.limit("5 per minute")  # NEW: Prevent spam signups
 def signup():
     if request.method == 'OPTIONS':
         return jsonify({'success': True}), 200
@@ -284,7 +456,6 @@ def signup():
     }), 201
 
 @app.route('/api/login', methods=['POST', 'OPTIONS'])
-@limiter.limit("10 per minute")  # NEW: Prevent brute force
 def login():
     if request.method == 'OPTIONS':
         return jsonify({'success': True}), 200
@@ -326,6 +497,8 @@ def get_me(current_restaurant):
         'owner_name': current_restaurant.owner_name,
         'upi_id': current_restaurant.upi_id,
         'logo_url': current_restaurant.logo_url,
+        'profile_picture': current_restaurant.profile_picture,
+        'is_google_user': current_restaurant.is_google_user,
         'is_subscribed': current_restaurant.is_subscribed,
         'trial_days_left': days_left,
         'is_trial_expired': is_expired
@@ -368,12 +541,11 @@ def subscribe_restaurant(current_restaurant):
     })
 
 # =====================================================================
-# PROFILE & MENU ROUTES (with rate limits for protected endpoints)
+# PROFILE & MENU ROUTES
 # =====================================================================
 
 @app.route('/api/profile', methods=['PUT', 'OPTIONS'])
 @token_required
-@limiter.limit("10 per minute")  # NEW
 def update_profile(current_restaurant):
     if request.method == 'OPTIONS':
         return jsonify({'success': True}), 200
@@ -394,7 +566,6 @@ def update_profile(current_restaurant):
 
 @app.route('/api/menu-items', methods=['GET', 'POST', 'OPTIONS'])
 @token_required
-@limiter.limit("30 per minute")  # NEW: Prevent spam
 def handle_menu_items(current_restaurant):
     if request.method == 'OPTIONS':
         return jsonify({'success': True}), 200
@@ -434,7 +605,6 @@ def handle_menu_items(current_restaurant):
 
 @app.route('/api/menu/toggle/<int:item_id>', methods=['PUT', 'OPTIONS'])
 @token_required
-@limiter.limit("20 per minute")
 def toggle_item_status(current_restaurant, item_id):
     if request.method == 'OPTIONS':
         return jsonify({'success': True}), 200
@@ -453,7 +623,6 @@ def toggle_item_status(current_restaurant, item_id):
 
 @app.route('/api/menu-items/<int:item_id>', methods=['PUT', 'DELETE', 'OPTIONS'])
 @token_required
-@limiter.limit("20 per minute")
 def update_delete_item(current_restaurant, item_id):
     if request.method == 'OPTIONS':
         return jsonify({'success': True}), 200
@@ -483,18 +652,17 @@ def update_delete_item(current_restaurant, item_id):
         return jsonify({'success': True})
 
 # =====================================================================
-# QR CODE GENERATION
+# QR CODE GENERATION — HIGH RESOLUTION
 # =====================================================================
 
 @app.route('/api/generate-qr', methods=['POST', 'OPTIONS'])
 @token_required
-@limiter.limit("10 per minute")  # NEW: Prevent QR spam
 def generate_qr(current_restaurant):
     if request.method == 'OPTIONS':
         return jsonify({'success': True}), 200
     
     try:
-        FRONTEND_URL = "https://codewithahmed2005.github.io/ScanEats"
+        FRONTEND_URL = os.environ.get('FRONTEND_URL', 'https://codewithahmed2005.github.io/ScanEats')
         menu_url = f"{FRONTEND_URL}/menu.html?id={current_restaurant.id}"
         
         qr = qrcode.QRCode(
@@ -529,11 +697,10 @@ def generate_qr(current_restaurant):
         return jsonify({'error': str(e)}), 500
 
 # =====================================================================
-# PUBLIC MENU (WITH RATE LIMITING - MOST IMPORTANT)
+# PUBLIC MENU
 # =====================================================================
 
 @app.route('/api/menu/<int:restaurant_id>', methods=['GET', 'OPTIONS'])
-@limiter.limit("100 per minute")  # ✅ NEW: Max 100 requests per IP per minute
 def get_public_menu(restaurant_id):
     if request.method == 'OPTIONS':
         return jsonify({'success': True}), 200
@@ -566,11 +733,10 @@ def get_public_menu(restaurant_id):
     return jsonify(response_data)
 
 # =====================================================================
-# DEBUG ENDPOINT (with rate limit)
+# DEBUG ENDPOINT
 # =====================================================================
 
 @app.route('/api/debug/menu/<int:restaurant_id>', methods=['GET', 'OPTIONS'])
-@limiter.limit("10 per minute")  # NEW
 def debug_menu(restaurant_id):
     if request.method == 'OPTIONS':
         return jsonify({'success': True}), 200
