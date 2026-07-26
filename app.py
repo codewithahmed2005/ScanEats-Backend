@@ -5,7 +5,7 @@ import jwt
 import datetime
 from io import BytesIO
 from functools import wraps
-from flask import Flask, request, jsonify, redirect, session, url_for
+from flask import Flask, request, jsonify, redirect
 from flask_sqlalchemy import SQLAlchemy
 from flask_cors import CORS
 from werkzeug.security import generate_password_hash, check_password_hash
@@ -13,7 +13,7 @@ from datetime import datetime, timedelta
 from sqlalchemy import inspect, text, Index
 
 # =====================================================================
-# NEW: Google OAuth
+# NEW: Web3Forms & Requests
 # =====================================================================
 import requests
 from google.oauth2 import id_token
@@ -34,7 +34,7 @@ app.config['SESSION_COOKIE_SECURE'] = True
 app.config['SESSION_COOKIE_SAMESITE'] = 'Lax'
 
 # =====================================================================
-# GOOGLE OATH CONFIG (NEW)
+# GOOGLE OATH CONFIG
 # =====================================================================
 GOOGLE_CLIENT_ID = os.environ.get('GOOGLE_CLIENT_ID')
 GOOGLE_CLIENT_SECRET = os.environ.get('GOOGLE_CLIENT_SECRET')
@@ -75,10 +75,10 @@ cache = Cache(app)
 Compress(app)
 
 # =====================================================================
-# CORS SETUP (Updated for OAuth)
+# CORS SETUP
 # =====================================================================
 CORS(app,
-     origins=[APP_BASE_URL, "https://codewithahmed2005.github.io", "http://localhost:5500", "http://127.0.0.1:5500"],
+     origins=["*"],
      methods=["GET", "POST", "PUT", "DELETE", "OPTIONS"],
      allow_headers=["Content-Type", "Authorization", "Accept"],
      supports_credentials=True)
@@ -95,7 +95,7 @@ class Restaurant(db.Model):
     upi_id = db.Column(db.String(50), nullable=True)
     logo_url = db.Column(db.String(255), nullable=True)
     
-    # NEW: Google OAuth Fields
+    # Google OAuth Fields
     google_id = db.Column(db.String(255), unique=True, nullable=True)
     profile_picture = db.Column(db.String(500), nullable=True)
     is_google_user = db.Column(db.Boolean, default=False)
@@ -266,16 +266,13 @@ def token_required(f):
     return decorated
 
 # =====================================================================
-# GOOGLE OATH ROUTES (NEW)
+# GOOGLE OATH ROUTES
 # =====================================================================
 
 @app.route('/api/auth/google', methods=['GET'])
 def google_login():
-    """Redirect user to Google OAuth consent screen"""
     try:
-        # Build Google OAuth URL
         redirect_uri = f"{APP_BASE_URL}/api/auth/google/callback"
-        
         params = {
             'client_id': GOOGLE_CLIENT_ID,
             'redirect_uri': redirect_uri,
@@ -284,10 +281,8 @@ def google_login():
             'access_type': 'offline',
             'prompt': 'select_account'
         }
-        
         auth_url = f"{GOOGLE_AUTH_URL}?{requests.compat.urlencode(params)}"
         return redirect(auth_url)
-        
     except Exception as e:
         print(f"Google Auth Error: {str(e)}")
         return redirect(f"{APP_BASE_URL}/auth.html?error=google_auth_failed")
@@ -295,9 +290,7 @@ def google_login():
 
 @app.route('/api/auth/google/callback', methods=['GET'])
 def google_callback():
-    """Handle Google OAuth callback"""
     try:
-        # Get authorization code from Google
         code = request.args.get('code')
         error = request.args.get('error')
         
@@ -307,9 +300,7 @@ def google_callback():
         if not code:
             return redirect(f"{APP_BASE_URL}/auth.html?error=no_code")
         
-        # Exchange code for access token
         redirect_uri = f"{APP_BASE_URL}/api/auth/google/callback"
-        
         token_data = {
             'code': code,
             'client_id': GOOGLE_CLIENT_ID,
@@ -317,7 +308,6 @@ def google_callback():
             'redirect_uri': redirect_uri,
             'grant_type': 'authorization_code'
         }
-        
         token_response = requests.post(GOOGLE_TOKEN_URL, data=token_data)
         token_json = token_response.json()
         
@@ -326,8 +316,6 @@ def google_callback():
             return redirect(f"{APP_BASE_URL}/auth.html?error=token_failed")
         
         access_token = token_json['access_token']
-        
-        # Get user info from Google
         userinfo_response = requests.get(
             GOOGLE_USERINFO_URL,
             headers={'Authorization': f'Bearer {access_token}'}
@@ -342,37 +330,25 @@ def google_callback():
         google_id = userinfo.get('id', '')
         profile_picture = userinfo.get('picture', '')
         
-        # =============================================================
-        # CHECK IF USER EXISTS
-        # =============================================================
         user = Restaurant.query.filter_by(email=email).first()
         
         if user:
-            # Existing user - check if Google linked
             if not user.is_google_user:
-                # Link Google account to existing user
                 user.google_id = google_id
                 user.is_google_user = True
                 user.profile_picture = profile_picture
                 if not user.owner_name and name:
                     user.owner_name = name
                 db.session.commit()
-            
-            # Update trial if not set
             if not user.trial_start_date:
                 now = datetime.utcnow().replace(hour=0, minute=0, second=0, microsecond=0)
                 user.trial_start_date = now
                 db.session.commit()
-            
         else:
-            # NEW USER - Auto register with Google
             now = datetime.utcnow().replace(hour=0, minute=0, second=0, microsecond=0)
-            
-            # Extract restaurant name from email or use default
             restaurant_name = email.split('@')[0].replace('.', ' ').title()
             if not restaurant_name:
                 restaurant_name = "My Restaurant"
-            
             user = Restaurant(
                 email=email,
                 owner_name=name or restaurant_name,
@@ -386,15 +362,11 @@ def google_callback():
             db.session.add(user)
             db.session.commit()
         
-        # =============================================================
-        # GENERATE JWT TOKEN
-        # =============================================================
         token = jwt.encode({
             'restaurant_id': user.id,
             'exp': datetime.utcnow() + timedelta(days=30)
         }, app.config['SECRET_KEY'], algorithm="HS256")
         
-        # Redirect to frontend with token
         frontend_url = os.environ.get('FRONTEND_URL', 'https://codewithahmed2005.github.io/ScanEats')
         return redirect(f"{frontend_url}/auth.html?token={token}&google_auth=success")
         
@@ -405,7 +377,6 @@ def google_callback():
 
 @app.route('/api/auth/google/status', methods=['GET'])
 def google_auth_status():
-    """Check if Google OAuth is configured"""
     has_google_config = bool(GOOGLE_CLIENT_ID and GOOGLE_CLIENT_SECRET)
     return jsonify({
         'configured': has_google_config,
@@ -413,7 +384,60 @@ def google_auth_status():
     })
 
 # =====================================================================
-# AUTH ROUTES (Updated)
+# CONTACT FORM API (NEW - Web3Forms Proxy)
+# =====================================================================
+
+@app.route('/api/contact', methods=['POST', 'OPTIONS'])
+def contact():
+    if request.method == 'OPTIONS':
+        return jsonify({'success': True}), 200
+    
+    try:
+        data = request.get_json()
+        
+        # Get Web3Forms access key from environment
+        access_key = os.environ.get('WEB3FORMS_ACCESS_KEY')
+        if not access_key:
+            print("❌ WEB3FORMS_ACCESS_KEY not configured in environment")
+            return jsonify({'success': False, 'error': 'Contact form not configured'}), 500
+        
+        # Prepare payload for Web3Forms
+        payload = {
+            'access_key': access_key,
+            'name': data.get('name'),
+            'email': data.get('email'),
+            'subject': data.get('subject', 'ScanEats Support'),
+            'message': data.get('message')
+        }
+        
+        # Send to Web3Forms
+        response = requests.post(
+            'https://api.web3forms.com/submit',
+            json=payload,
+            timeout=30
+        )
+        
+        result = response.json()
+        
+        if result.get('success'):
+            print(f"✅ Contact form submitted: {data.get('name')} - {data.get('email')}")
+            return jsonify({'success': True, 'message': 'Message sent successfully!'})
+        else:
+            print(f"❌ Web3Forms error: {result}")
+            return jsonify({'success': False, 'error': result.get('message', 'Failed to send message')}), 400
+            
+    except requests.exceptions.Timeout:
+        print("❌ Web3Forms timeout")
+        return jsonify({'success': False, 'error': 'Request timed out. Please try again.'}), 408
+    except requests.exceptions.RequestException as e:
+        print(f"❌ Web3Forms request error: {str(e)}")
+        return jsonify({'success': False, 'error': 'Network error. Please try again.'}), 500
+    except Exception as e:
+        print(f"❌ Contact form error: {str(e)}")
+        return jsonify({'success': False, 'error': str(e)}), 500
+
+# =====================================================================
+# AUTH ROUTES
 # =====================================================================
 
 @app.route('/api/signup', methods=['POST', 'OPTIONS'])
