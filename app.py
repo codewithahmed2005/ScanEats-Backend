@@ -384,7 +384,7 @@ def google_auth_status():
     })
 
 # =====================================================================
-# CONTACT FORM API (NEW - Web3Forms Proxy)
+# CONTACT FORM API (Web3Forms Proxy)
 # =====================================================================
 
 @app.route('/api/contact', methods=['POST', 'OPTIONS'])
@@ -395,20 +395,37 @@ def contact():
     try:
         data = request.get_json()
         
+        # Log incoming data
+        print(f"📥 Contact form received: {data.get('name')} - {data.get('email')}")
+        
+        # Validate required fields
+        required_fields = ['name', 'email', 'subject', 'message']
+        for field in required_fields:
+            if not data.get(field):
+                return jsonify({
+                    'success': False, 
+                    'error': f'Missing required field: {field}'
+                }), 400
+        
         # Get Web3Forms access key from environment
         access_key = os.environ.get('WEB3FORMS_ACCESS_KEY')
         if not access_key:
-            print("❌ WEB3FORMS_ACCESS_KEY not configured in environment")
-            return jsonify({'success': False, 'error': 'Contact form not configured'}), 500
+            print("❌ WEB3FORMS_ACCESS_KEY not configured")
+            return jsonify({
+                'success': False, 
+                'error': 'Contact form not configured'
+            }), 500
         
         # Prepare payload for Web3Forms
         payload = {
             'access_key': access_key,
             'name': data.get('name'),
             'email': data.get('email'),
-            'subject': data.get('subject', 'ScanEats Support'),
+            'subject': data.get('subject'),
             'message': data.get('message')
         }
+        
+        print(f"📤 Sending to Web3Forms: {payload}")
         
         # Send to Web3Forms
         response = requests.post(
@@ -418,23 +435,36 @@ def contact():
         )
         
         result = response.json()
+        print(f"📥 Web3Forms response: {result}")
         
         if result.get('success'):
             print(f"✅ Contact form submitted: {data.get('name')} - {data.get('email')}")
             return jsonify({'success': True, 'message': 'Message sent successfully!'})
         else:
             print(f"❌ Web3Forms error: {result}")
-            return jsonify({'success': False, 'error': result.get('message', 'Failed to send message')}), 400
+            return jsonify({
+                'success': False, 
+                'error': result.get('message', 'Failed to send message')
+            }), 400
             
     except requests.exceptions.Timeout:
         print("❌ Web3Forms timeout")
-        return jsonify({'success': False, 'error': 'Request timed out. Please try again.'}), 408
+        return jsonify({
+            'success': False, 
+            'error': 'Request timed out. Please try again.'
+        }), 408
     except requests.exceptions.RequestException as e:
         print(f"❌ Web3Forms request error: {str(e)}")
-        return jsonify({'success': False, 'error': 'Network error. Please try again.'}), 500
+        return jsonify({
+            'success': False, 
+            'error': 'Network error. Please try again.'
+        }), 500
     except Exception as e:
         print(f"❌ Contact form error: {str(e)}")
-        return jsonify({'success': False, 'error': str(e)}), 500
+        return jsonify({
+            'success': False, 
+            'error': str(e)
+        }), 500
 
 # =====================================================================
 # AUTH ROUTES
