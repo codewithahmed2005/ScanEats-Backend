@@ -13,7 +13,7 @@ from datetime import datetime, timedelta
 from sqlalchemy import inspect, text, Index
 
 # =====================================================================
-# NEW: Web3Forms & Requests
+# Web3Forms & Requests
 # =====================================================================
 import requests
 from google.oauth2 import id_token
@@ -384,7 +384,7 @@ def google_auth_status():
     })
 
 # =====================================================================
-# CONTACT FORM API (Web3Forms Proxy)
+# CONTACT FORM API (Web3Forms Proxy) — FIXED
 # =====================================================================
 
 @app.route('/api/contact', methods=['POST', 'OPTIONS'])
@@ -395,34 +395,49 @@ def contact():
     try:
         data = request.get_json()
         
-        # Log incoming data
-        print(f"📥 Contact form received: {data.get('name')} - {data.get('email')}")
+        # Log incoming data for debugging
+        print(f"📥 Full request data: {data}")
+        
+        # Check if data exists
+        if not data:
+            print("❌ No JSON data received")
+            return jsonify({'success': False, 'error': 'No data received'}), 400
+        
+        # Get required fields with fallback
+        name = data.get('name', '').strip()
+        email = data.get('email', '').strip()
+        subject = data.get('subject', 'ScanEats Support Request')
+        message = data.get('message', '').strip()
         
         # Validate required fields
-        required_fields = ['name', 'email', 'subject', 'message']
-        for field in required_fields:
-            if not data.get(field):
-                return jsonify({
-                    'success': False, 
-                    'error': f'Missing required field: {field}'
-                }), 400
+        if not name:
+            print("❌ Missing name")
+            return jsonify({'success': False, 'error': 'Name is required'}), 400
+        
+        if not email:
+            print("❌ Missing email")
+            return jsonify({'success': False, 'error': 'Email is required'}), 400
+        
+        if not message:
+            print("❌ Missing message")
+            return jsonify({'success': False, 'error': 'Message is required'}), 400
         
         # Get Web3Forms access key from environment
         access_key = os.environ.get('WEB3FORMS_ACCESS_KEY')
         if not access_key:
-            print("❌ WEB3FORMS_ACCESS_KEY not configured")
+            print("❌ WEB3FORMS_ACCESS_KEY not configured in environment")
             return jsonify({
                 'success': False, 
-                'error': 'Contact form not configured'
+                'error': 'Contact form not configured. Please contact support.'
             }), 500
         
-        # Prepare payload for Web3Forms
+        # Build Web3Forms payload
         payload = {
             'access_key': access_key,
-            'name': data.get('name'),
-            'email': data.get('email'),
-            'subject': data.get('subject'),
-            'message': data.get('message')
+            'name': name,
+            'email': email,
+            'subject': subject,
+            'message': message
         }
         
         print(f"📤 Sending to Web3Forms: {payload}")
@@ -431,20 +446,28 @@ def contact():
         response = requests.post(
             'https://api.web3forms.com/submit',
             json=payload,
-            timeout=30
+            timeout=30,
+            headers={'Content-Type': 'application/json'}
         )
+        
+        # Log response status
+        print(f"📥 Web3Forms status: {response.status_code}")
         
         result = response.json()
         print(f"📥 Web3Forms response: {result}")
         
         if result.get('success'):
-            print(f"✅ Contact form submitted: {data.get('name')} - {data.get('email')}")
-            return jsonify({'success': True, 'message': 'Message sent successfully!'})
+            print(f"✅ Message sent: {name} - {email}")
+            return jsonify({
+                'success': True, 
+                'message': 'Message sent successfully!'
+            })
         else:
-            print(f"❌ Web3Forms error: {result}")
+            error_msg = result.get('message', 'Failed to send message')
+            print(f"❌ Web3Forms error: {error_msg}")
             return jsonify({
                 'success': False, 
-                'error': result.get('message', 'Failed to send message')
+                'error': error_msg
             }), 400
             
     except requests.exceptions.Timeout:
