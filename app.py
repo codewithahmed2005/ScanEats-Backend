@@ -384,7 +384,25 @@ def google_auth_status():
     })
 
 # =====================================================================
-# CONTACT FORM API (Web3Forms Proxy) — FIXED
+# GET WEB3FORMS ACCESS KEY (NEW - For Frontend)
+# =====================================================================
+
+@app.route('/api/config/web3forms', methods=['GET', 'OPTIONS'])
+def get_web3forms_key():
+    if request.method == 'OPTIONS':
+        return jsonify({'success': True}), 200
+    
+    access_key = os.environ.get('WEB3FORMS_ACCESS_KEY')
+    if not access_key:
+        return jsonify({'error': 'Access key not configured'}), 500
+    
+    return jsonify({
+        'success': True,
+        'access_key': access_key
+    })
+
+# =====================================================================
+# CONTACT FORM API (Web3Forms Proxy)
 # =====================================================================
 
 @app.route('/api/contact', methods=['POST', 'OPTIONS'])
