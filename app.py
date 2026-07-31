@@ -3,6 +3,8 @@ import qrcode
 import base64
 import jwt
 import datetime
+import hmac
+import hashlib
 from io import BytesIO
 from functools import wraps
 from flask import Flask, request, jsonify, redirect
@@ -13,8 +15,12 @@ from datetime import datetime, timedelta
 from sqlalchemy import inspect, text, Index
 
 # =====================================================================
-# Web3Forms & Requests
+# RAZORPAY SDK (NEW)
 # =====================================================================
+import razorpay
+from razorpay.errors import SignatureVerificationError
+
+# Web3Forms & Requests
 import requests
 from google.oauth2 import id_token
 from google.auth.transport import requests as google_requests
@@ -32,6 +38,35 @@ app = Flask(__name__)
 app.config['SECRET_KEY'] = os.environ.get('SECRET_KEY', 'super-secret-scaneats-key-2024')
 app.config['SESSION_COOKIE_SECURE'] = True
 app.config['SESSION_COOKIE_SAMESITE'] = 'Lax'
+
+# =====================================================================
+# RAZORPAY CONFIG (NEW)
+# =====================================================================
+RAZORPAY_KEY_ID = os.environ.get('RAZORPAY_KEY_ID')
+RAZORPAY_KEY_SECRET = os.environ.get('RAZORPAY_KEY_SECRET')
+razorpay_client = razorpay.Client(auth=(RAZORPAY_KEY_ID, RAZORPAY_KEY_SECRET))
+
+# Plan Configuration
+PLANS = {
+    '3_months': {
+        'amount': 49900,
+        'currency': 'INR',
+        'duration_days': 90,
+        'name': '3 Months Plan'
+    },
+    '6_months': {
+        'amount': 79900,
+        'currency': 'INR',
+        'duration_days': 180,
+        'name': '6 Months Plan'
+    },
+    '12_months': {
+        'amount': 119900,
+        'currency': 'INR',
+        'duration_days': 365,
+        'name': '12 Months Plan'
+    }
+}
 
 # =====================================================================
 # GOOGLE OATH CONFIG
@@ -100,10 +135,17 @@ class Restaurant(db.Model):
     profile_picture = db.Column(db.String(500), nullable=True)
     is_google_user = db.Column(db.Boolean, default=False)
     
+    # Trial & Subscription Fields
     trial_start_date = db.Column(db.DateTime, nullable=True)
     is_subscribed = db.Column(db.Boolean, default=False)
     
+    # NEW: Razorpay Subscription Fields
+    subscription_plan = db.Column(db.String(20), nullable=True)
+    subscription_expiry = db.Column(db.DateTime, nullable=True)
+    razorpay_customer_id = db.Column(db.String(100), nullable=True)
+    
     menu_items = db.relationship('MenuItem', backref='restaurant', lazy=True, cascade='all, delete-orphan')
+    transactions = db.relationship('PaymentTransaction', backref='restaurant', lazy=True)
 
     def set_password(self, password): 
         self.password_hash = generate_password_hash(password)
@@ -128,6 +170,33 @@ class Restaurant(db.Model):
             return False
         days_left = self.get_trial_days_left()
         return days_left == 0
+    
+    def has_active_subscription(self):
+        """Check if user has an active paid subscription"""
+        if not self.is_subscribed:
+            return False
+        if not self.subscription_expiry:
+            return False
+        return self.subscription_expiry > datetime.utcnow()
+
+
+class PaymentTransaction(db.Model):
+    __tablename__ = 'payment_transactions'
+    
+    id = db.Column(db.Integer, primary_key=True)
+    restaurant_id = db.Column(db.Integer, db.ForeignKey('restaurant.id'), nullable=False)
+    razorpay_order_id = db.Column(db.String(100), unique=True, nullable=False)
+    razorpay_payment_id = db.Column(db.String(100), nullable=True)
+    razorpay_signature = db.Column(db.String(200), nullable=True)
+    amount = db.Column(db.Integer, nullable=False)  # in paise
+    currency = db.Column(db.String(10), default='INR')
+    plan = db.Column(db.String(20), nullable=False)
+    status = db.Column(db.String(20), default='PENDING')
+    created_at = db.Column(db.DateTime, default=datetime.utcnow)
+    updated_at = db.Column(db.DateTime, default=datetime.utcnow, onupdate=datetime.utcnow)
+    
+    def __repr__(self):
+        return f'<PaymentTransaction {self.razorpay_order_id} - {self.status}>'
 
 
 class MenuItem(db.Model):
@@ -149,7 +218,10 @@ class MenuItem(db.Model):
     is_veg = db.Column(db.Boolean, default=True)
     is_active = db.Column(db.Boolean, default=True)
 
-# --- Create Tables with Migration ---
+
+# =====================================================================
+# DATABASE MIGRATION (Add new columns)
+# =====================================================================
 with app.app_context():
     db.create_all()
     
@@ -158,7 +230,21 @@ with app.app_context():
         columns = [col['name'] for col in inspector.get_columns('restaurant')]
         is_sqlite = 'sqlite' in str(db.engine.url)
         
-        # Add new columns for Google OAuth
+        # Add Razorpay columns
+        if 'subscription_plan' not in columns:
+            with db.engine.connect() as conn:
+                if is_sqlite:
+                    conn.execute(text('ALTER TABLE restaurant ADD COLUMN subscription_plan VARCHAR(20)'))
+                    conn.execute(text('ALTER TABLE restaurant ADD COLUMN subscription_expiry DATETIME'))
+                    conn.execute(text('ALTER TABLE restaurant ADD COLUMN razorpay_customer_id VARCHAR(100)'))
+                else:
+                    conn.execute(text('ALTER TABLE restaurant ADD COLUMN subscription_plan VARCHAR(20)'))
+                    conn.execute(text('ALTER TABLE restaurant ADD COLUMN subscription_expiry TIMESTAMP'))
+                    conn.execute(text('ALTER TABLE restaurant ADD COLUMN razorpay_customer_id VARCHAR(100)'))
+                conn.commit()
+            print("✅ Added Razorpay subscription columns")
+        
+        # Add Google OAuth columns if not exists
         if 'google_id' not in columns:
             with db.engine.connect() as conn:
                 if is_sqlite:
@@ -264,6 +350,227 @@ def token_required(f):
             
         return f(current_restaurant, *args, **kwargs)
     return decorated
+
+# =====================================================================
+# RAZORPAY ROUTES (NEW)
+# =====================================================================
+
+@app.route('/api/create-order', methods=['POST', 'OPTIONS'])
+@token_required
+def create_order(current_restaurant):
+    if request.method == 'OPTIONS':
+        return jsonify({'success': True}), 200
+    
+    try:
+        data = request.get_json()
+        plan_key = data.get('plan', '3_months')
+        
+        if plan_key not in PLANS:
+            return jsonify({'error': 'Invalid plan selected'}), 400
+        
+        plan = PLANS[plan_key]
+        
+        # Check if user already has active subscription
+        if current_restaurant.has_active_subscription():
+            return jsonify({
+                'error': 'You already have an active subscription',
+                'already_subscribed': True
+            }), 400
+        
+        # Create Razorpay Order
+        order_data = {
+            'amount': plan['amount'],
+            'currency': plan['currency'],
+            'receipt': f'receipt_{current_restaurant.id}_{int(datetime.utcnow().timestamp())}',
+            'payment_capture': 1,
+            'notes': {
+                'restaurant_id': current_restaurant.id,
+                'plan': plan_key,
+                'restaurant_email': current_restaurant.email
+            }
+        }
+        
+        order = razorpay_client.order.create(data=order_data)
+        
+        # Save transaction to database
+        transaction = PaymentTransaction(
+            restaurant_id=current_restaurant.id,
+            razorpay_order_id=order['id'],
+            amount=plan['amount'],
+            currency=plan['currency'],
+            plan=plan_key,
+            status='PENDING'
+        )
+        db.session.add(transaction)
+        db.session.commit()
+        
+        return jsonify({
+            'success': True,
+            'order_id': order['id'],
+            'amount': plan['amount'],
+            'currency': plan['currency'],
+            'key_id': RAZORPAY_KEY_ID,
+            'plan_name': plan['name']
+        })
+        
+    except Exception as e:
+        print(f"❌ Order creation error: {str(e)}")
+        return jsonify({'error': str(e)}), 500
+
+
+@app.route('/api/verify-payment', methods=['POST', 'OPTIONS'])
+@token_required
+def verify_payment(current_restaurant):
+    if request.method == 'OPTIONS':
+        return jsonify({'success': True}), 200
+    
+    try:
+        data = request.get_json()
+        
+        razorpay_order_id = data.get('razorpay_order_id')
+        razorpay_payment_id = data.get('razorpay_payment_id')
+        razorpay_signature = data.get('razorpay_signature')
+        
+        if not all([razorpay_order_id, razorpay_payment_id, razorpay_signature]):
+            return jsonify({'error': 'Missing payment details'}), 400
+        
+        # Find transaction
+        transaction = PaymentTransaction.query.filter_by(
+            razorpay_order_id=razorpay_order_id,
+            restaurant_id=current_restaurant.id
+        ).first()
+        
+        if not transaction:
+            return jsonify({'error': 'Transaction not found'}), 404
+        
+        if transaction.status == 'SUCCESS':
+            return jsonify({'error': 'Payment already verified'}), 400
+        
+        # =============================================================
+        # VERIFY HMAC SHA256 SIGNATURE
+        # =============================================================
+        try:
+            razorpay_client.utility.verify_payment_signature({
+                'razorpay_order_id': razorpay_order_id,
+                'razorpay_payment_id': razorpay_payment_id,
+                'razorpay_signature': razorpay_signature
+            })
+            
+            # ✅ Signature verified successfully
+            transaction.razorpay_payment_id = razorpay_payment_id
+            transaction.razorpay_signature = razorpay_signature
+            transaction.status = 'SUCCESS'
+            
+            # Activate subscription
+            plan = PLANS.get(transaction.plan)
+            if plan:
+                current_restaurant.is_subscribed = True
+                current_restaurant.subscription_plan = transaction.plan
+                current_restaurant.subscription_expiry = datetime.utcnow() + timedelta(days=plan['duration_days'])
+            
+            db.session.commit()
+            
+            return jsonify({
+                'success': True,
+                'message': 'Payment verified successfully! Subscription activated.',
+                'subscription_expiry': current_restaurant.subscription_expiry.isoformat() if current_restaurant.subscription_expiry else None
+            })
+            
+        except SignatureVerificationError as e:
+            # ❌ Invalid signature
+            transaction.status = 'FAILED'
+            db.session.commit()
+            print(f"❌ Signature verification failed: {str(e)}")
+            return jsonify({'error': 'Payment verification failed'}), 400
+            
+    except Exception as e:
+        print(f"❌ Payment verification error: {str(e)}")
+        return jsonify({'error': str(e)}), 500
+
+
+@app.route('/api/subscription-status', methods=['GET', 'OPTIONS'])
+@token_required
+def get_subscription_status(current_restaurant):
+    if request.method == 'OPTIONS':
+        return jsonify({'success': True}), 200
+    
+    is_active = current_restaurant.has_active_subscription()
+    expiry = current_restaurant.subscription_expiry
+    
+    return jsonify({
+        'success': True,
+        'is_subscribed': current_restaurant.is_subscribed,
+        'has_active': is_active,
+        'subscription_plan': current_restaurant.subscription_plan,
+        'subscription_expiry': expiry.isoformat() if expiry else None,
+        'days_remaining': (expiry - datetime.utcnow()).days if expiry and is_active else 0
+    })
+
+
+@app.route('/api/webhook/razorpay', methods=['POST'])
+def razorpay_webhook():
+    """
+    Razorpay Webhook Handler
+    Called by Razorpay for async payment status updates
+    """
+    try:
+        webhook_secret = os.environ.get('RAZORPAY_WEBHOOK_SECRET')
+        
+        # Verify webhook signature
+        received_signature = request.headers.get('X-Razorpay-Signature')
+        if webhook_secret and received_signature:
+            expected_signature = hmac.new(
+                webhook_secret.encode(),
+                request.data,
+                hashlib.sha256
+            ).hexdigest()
+            
+            if not hmac.compare_digest(expected_signature, received_signature):
+                return jsonify({'error': 'Invalid webhook signature'}), 401
+        
+        event_data = request.get_json()
+        event_type = event_data.get('event')
+        
+        print(f"📥 Webhook received: {event_type}")
+        
+        if event_type == 'payment.captured':
+            payment_data = event_data.get('payload', {}).get('payment', {}).get('entity', {})
+            order_id = payment_data.get('order_id')
+            payment_id = payment_data.get('id')
+            
+            # Find transaction
+            transaction = PaymentTransaction.query.filter_by(razorpay_order_id=order_id).first()
+            if transaction and transaction.status == 'PENDING':
+                transaction.razorpay_payment_id = payment_id
+                transaction.status = 'SUCCESS'
+                
+                # Activate subscription
+                restaurant = Restaurant.query.get(transaction.restaurant_id)
+                if restaurant:
+                    plan = PLANS.get(transaction.plan)
+                    if plan:
+                        restaurant.is_subscribed = True
+                        restaurant.subscription_plan = transaction.plan
+                        restaurant.subscription_expiry = datetime.utcnow() + timedelta(days=plan['duration_days'])
+                
+                db.session.commit()
+                print(f"✅ Webhook: Payment {payment_id} captured and subscription activated")
+        
+        elif event_type == 'payment.failed':
+            payment_data = event_data.get('payload', {}).get('payment', {}).get('entity', {})
+            order_id = payment_data.get('order_id')
+            
+            transaction = PaymentTransaction.query.filter_by(razorpay_order_id=order_id).first()
+            if transaction:
+                transaction.status = 'FAILED'
+                db.session.commit()
+                print(f"❌ Webhook: Payment {order_id} failed")
+        
+        return jsonify({'success': True}), 200
+        
+    except Exception as e:
+        print(f"❌ Webhook error: {str(e)}")
+        return jsonify({'error': str(e)}), 500
 
 # =====================================================================
 # GOOGLE OATH ROUTES
@@ -384,7 +691,7 @@ def google_auth_status():
     })
 
 # =====================================================================
-# GET WEB3FORMS ACCESS KEY (NEW - For Frontend)
+# GET WEB3FORMS ACCESS KEY
 # =====================================================================
 
 @app.route('/api/config/web3forms', methods=['GET', 'OPTIONS'])
@@ -412,44 +719,34 @@ def contact():
     
     try:
         data = request.get_json()
-        
-        # Log incoming data for debugging
         print(f"📥 Full request data: {data}")
         
-        # Check if data exists
         if not data:
             print("❌ No JSON data received")
             return jsonify({'success': False, 'error': 'No data received'}), 400
         
-        # Get required fields with fallback
         name = data.get('name', '').strip()
         email = data.get('email', '').strip()
         subject = data.get('subject', 'ScanEats Support Request')
         message = data.get('message', '').strip()
         
-        # Validate required fields
         if not name:
-            print("❌ Missing name")
             return jsonify({'success': False, 'error': 'Name is required'}), 400
         
         if not email:
-            print("❌ Missing email")
             return jsonify({'success': False, 'error': 'Email is required'}), 400
         
         if not message:
-            print("❌ Missing message")
             return jsonify({'success': False, 'error': 'Message is required'}), 400
         
-        # Get Web3Forms access key from environment
         access_key = os.environ.get('WEB3FORMS_ACCESS_KEY')
         if not access_key:
-            print("❌ WEB3FORMS_ACCESS_KEY not configured in environment")
+            print("❌ WEB3FORMS_ACCESS_KEY not configured")
             return jsonify({
                 'success': False, 
                 'error': 'Contact form not configured. Please contact support.'
             }), 500
         
-        # Build Web3Forms payload
         payload = {
             'access_key': access_key,
             'name': name,
@@ -460,7 +757,6 @@ def contact():
         
         print(f"📤 Sending to Web3Forms: {payload}")
         
-        # Send to Web3Forms
         response = requests.post(
             'https://api.web3forms.com/submit',
             json=payload,
@@ -468,44 +764,22 @@ def contact():
             headers={'Content-Type': 'application/json'}
         )
         
-        # Log response status
-        print(f"📥 Web3Forms status: {response.status_code}")
-        
         result = response.json()
         print(f"📥 Web3Forms response: {result}")
         
         if result.get('success'):
-            print(f"✅ Message sent: {name} - {email}")
-            return jsonify({
-                'success': True, 
-                'message': 'Message sent successfully!'
-            })
+            return jsonify({'success': True, 'message': 'Message sent successfully!'})
         else:
             error_msg = result.get('message', 'Failed to send message')
-            print(f"❌ Web3Forms error: {error_msg}")
-            return jsonify({
-                'success': False, 
-                'error': error_msg
-            }), 400
+            return jsonify({'success': False, 'error': error_msg}), 400
             
     except requests.exceptions.Timeout:
-        print("❌ Web3Forms timeout")
-        return jsonify({
-            'success': False, 
-            'error': 'Request timed out. Please try again.'
-        }), 408
+        return jsonify({'success': False, 'error': 'Request timed out. Please try again.'}), 408
     except requests.exceptions.RequestException as e:
-        print(f"❌ Web3Forms request error: {str(e)}")
-        return jsonify({
-            'success': False, 
-            'error': 'Network error. Please try again.'
-        }), 500
+        return jsonify({'success': False, 'error': 'Network error. Please try again.'}), 500
     except Exception as e:
         print(f"❌ Contact form error: {str(e)}")
-        return jsonify({
-            'success': False, 
-            'error': str(e)
-        }), 500
+        return jsonify({'success': False, 'error': str(e)}), 500
 
 # =====================================================================
 # AUTH ROUTES
@@ -595,6 +869,9 @@ def get_me(current_restaurant):
         'profile_picture': current_restaurant.profile_picture,
         'is_google_user': current_restaurant.is_google_user,
         'is_subscribed': current_restaurant.is_subscribed,
+        'subscription_plan': current_restaurant.subscription_plan,
+        'subscription_expiry': current_restaurant.subscription_expiry.isoformat() if current_restaurant.subscription_expiry else None,
+        'has_active_subscription': current_restaurant.has_active_subscription(),
         'trial_days_left': days_left,
         'is_trial_expired': is_expired
     })
@@ -611,14 +888,17 @@ def get_trial_status(current_restaurant):
     
     days_left = current_restaurant.get_trial_days_left()
     is_expired = current_restaurant.is_trial_expired()
+    has_active = current_restaurant.has_active_subscription()
     
     return jsonify({
         'success': True,
         'trial_start_date': current_restaurant.trial_start_date.isoformat() if current_restaurant.trial_start_date else None,
         'remaining_days': days_left,
         'is_subscribed': current_restaurant.is_subscribed,
+        'has_active_subscription': has_active,
         'is_expired': is_expired,
-        'trial_duration_days': 14
+        'trial_duration_days': 14,
+        'subscription_expiry': current_restaurant.subscription_expiry.isoformat() if current_restaurant.subscription_expiry else None
     })
 
 @app.route('/api/subscribe', methods=['POST', 'OPTIONS'])
@@ -645,7 +925,7 @@ def update_profile(current_restaurant):
     if request.method == 'OPTIONS':
         return jsonify({'success': True}), 200
     
-    if not current_restaurant.is_subscribed and current_restaurant.is_trial_expired():
+    if not current_restaurant.has_active_subscription() and current_restaurant.is_trial_expired():
         return jsonify({'error': 'Trial expired. Please subscribe to continue.'}), 403
     
     data = request.get_json()
@@ -665,7 +945,7 @@ def handle_menu_items(current_restaurant):
     if request.method == 'OPTIONS':
         return jsonify({'success': True}), 200
     
-    if not current_restaurant.is_subscribed and current_restaurant.is_trial_expired():
+    if not current_restaurant.has_active_subscription() and current_restaurant.is_trial_expired():
         if request.method == 'POST':
             return jsonify({'error': 'Trial expired. Please subscribe to continue.'}), 403
     
@@ -704,7 +984,7 @@ def toggle_item_status(current_restaurant, item_id):
     if request.method == 'OPTIONS':
         return jsonify({'success': True}), 200
     
-    if not current_restaurant.is_subscribed and current_restaurant.is_trial_expired():
+    if not current_restaurant.has_active_subscription() and current_restaurant.is_trial_expired():
         return jsonify({'error': 'Trial expired. Please subscribe to continue.'}), 403
     
     item = MenuItem.query.filter_by(id=item_id, restaurant_id=current_restaurant.id).first()
@@ -722,7 +1002,7 @@ def update_delete_item(current_restaurant, item_id):
     if request.method == 'OPTIONS':
         return jsonify({'success': True}), 200
     
-    if not current_restaurant.is_subscribed and current_restaurant.is_trial_expired():
+    if not current_restaurant.has_active_subscription() and current_restaurant.is_trial_expired():
         return jsonify({'error': 'Trial expired. Please subscribe to continue.'}), 403
     
     item = MenuItem.query.filter_by(id=item_id, restaurant_id=current_restaurant.id).first()
