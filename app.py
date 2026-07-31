@@ -3,8 +3,6 @@ import qrcode
 import base64
 import jwt
 import datetime
-import hmac
-import hashlib
 from io import BytesIO
 from functools import wraps
 from flask import Flask, request, jsonify, redirect
@@ -15,7 +13,7 @@ from datetime import datetime, timedelta
 from sqlalchemy import inspect, text, Index
 
 # =====================================================================
-# RAZORPAY SDK (NEW)
+# RAZORPAY SDK
 # =====================================================================
 import razorpay
 from razorpay.errors import SignatureVerificationError
@@ -40,7 +38,7 @@ app.config['SESSION_COOKIE_SECURE'] = True
 app.config['SESSION_COOKIE_SAMESITE'] = 'Lax'
 
 # =====================================================================
-# RAZORPAY CONFIG (NEW)
+# RAZORPAY CONFIG
 # =====================================================================
 RAZORPAY_KEY_ID = os.environ.get('RAZORPAY_KEY_ID')
 RAZORPAY_KEY_SECRET = os.environ.get('RAZORPAY_KEY_SECRET')
@@ -120,7 +118,10 @@ CORS(app,
 
 db = SQLAlchemy(app)
 
-# --- Database Models ---
+# =====================================================================
+# DATABASE MODELS (UPDATED)
+# =====================================================================
+
 class Restaurant(db.Model):
     id = db.Column(db.Integer, primary_key=True)
     restaurant_name = db.Column(db.String(120), nullable=True)
@@ -139,10 +140,14 @@ class Restaurant(db.Model):
     trial_start_date = db.Column(db.DateTime, nullable=True)
     is_subscribed = db.Column(db.Boolean, default=False)
     
-    # NEW: Razorpay Subscription Fields
+    # Razorpay Subscription Fields
     subscription_plan = db.Column(db.String(20), nullable=True)
-    subscription_expiry = db.Column(db.DateTime, nullable=True)
+    subscription_start_date = db.Column(db.DateTime, nullable=True)
+    subscription_end_date = db.Column(db.DateTime, nullable=True)
     razorpay_customer_id = db.Column(db.String(100), nullable=True)
+    
+    # Grace Period (optional)
+    grace_period_days = db.Column(db.Integer, default=0)
     
     menu_items = db.relationship('MenuItem', backref='restaurant', lazy=True, cascade='all, delete-orphan')
     transactions = db.relationship('PaymentTransaction', backref='restaurant', lazy=True)
@@ -155,7 +160,20 @@ class Restaurant(db.Model):
             return False
         return check_password_hash(self.password_hash, password)
     
+    # =============================================================
+    # SUBSCRIPTION STATUS HELPER FUNCTIONS (NEW)
+    # =============================================================
+    
+    def is_trial_active(self):
+        """Check if trial is still active"""
+        if not self.trial_start_date:
+            return False
+        today = datetime.utcnow().replace(hour=0, minute=0, second=0, microsecond=0)
+        trial_end = self.trial_start_date + timedelta(days=14)
+        return today <= trial_end
+    
     def get_trial_days_left(self):
+        """Calculate remaining trial days"""
         if self.is_subscribed:
             return None
         if not self.trial_start_date:
@@ -166,18 +184,69 @@ class Restaurant(db.Model):
         return max(0, days_left)
     
     def is_trial_expired(self):
+        """Check if trial is expired"""
         if self.is_subscribed:
             return False
         days_left = self.get_trial_days_left()
         return days_left == 0
     
-    def has_active_subscription(self):
-        """Check if user has an active paid subscription"""
+    # =============================================================
+    # SUBSCRIPTION ACTIVE CHECK (ZERO-TRUST)
+    # =============================================================
+    
+    def is_subscription_active(self):
+        """
+        ⭐ CRITICAL: Zero-trust subscription check
+        Returns True only if subscription is ACTIVE and NOT expired
+        """
+        # 1. Check if user has paid subscription
         if not self.is_subscribed:
             return False
-        if not self.subscription_expiry:
+        
+        # 2. Check if subscription_end_date exists
+        if not self.subscription_end_date:
             return False
-        return self.subscription_expiry > datetime.utcnow()
+        
+        # 3. Check if current time is within subscription period
+        now = datetime.utcnow()
+        return now <= self.subscription_end_date
+    
+    def get_subscription_status(self):
+        """Get detailed subscription status"""
+        if not self.is_subscribed:
+            return 'TRIAL'
+        
+        if self.is_subscription_active():
+            return 'ACTIVE'
+        else:
+            return 'EXPIRED'
+    
+    def get_subscription_days_left(self):
+        """Get days remaining in subscription"""
+        if not self.is_subscribed or not self.subscription_end_date:
+            return 0
+        
+        now = datetime.utcnow()
+        if now > self.subscription_end_date:
+            return 0
+        
+        days_left = (self.subscription_end_date - now).days
+        return max(0, days_left)
+    
+    def has_active_access(self):
+        """
+        ⭐ Master access check — used by ALL routes
+        Returns True if trial is active OR subscription is active
+        """
+        # Check paid subscription first
+        if self.is_subscription_active():
+            return True
+        
+        # Check trial if not subscribed
+        if not self.is_subscribed and self.is_trial_active():
+            return True
+        
+        return False
 
 
 class PaymentTransaction(db.Model):
@@ -188,7 +257,7 @@ class PaymentTransaction(db.Model):
     razorpay_order_id = db.Column(db.String(100), unique=True, nullable=False)
     razorpay_payment_id = db.Column(db.String(100), nullable=True)
     razorpay_signature = db.Column(db.String(200), nullable=True)
-    amount = db.Column(db.Integer, nullable=False)  # in paise
+    amount = db.Column(db.Integer, nullable=False)
     currency = db.Column(db.String(10), default='INR')
     plan = db.Column(db.String(20), nullable=False)
     status = db.Column(db.String(20), default='PENDING')
@@ -220,7 +289,51 @@ class MenuItem(db.Model):
 
 
 # =====================================================================
-# DATABASE MIGRATION (Add new columns)
+# SUBSCRIPTION LOCKOUT DECORATOR (NEW)
+# =====================================================================
+
+def require_active_access(f):
+    """
+    ⭐ ZERO-TRUST DECORATOR
+    Use this on ANY route that requires an active subscription or trial
+    """
+    @wraps(f)
+    def decorated(*args, **kwargs):
+        # Skip for OPTIONS requests
+        if request.method == 'OPTIONS':
+            return jsonify({'success': True}), 200
+        
+        # Get token
+        token = None
+        if 'Authorization' in request.headers:
+            token = request.headers['Authorization'].split(" ")[1]
+        
+        if not token:
+            return jsonify({'error': 'Authentication required'}), 401
+        
+        try:
+            data = jwt.decode(token, app.config['SECRET_KEY'], algorithms=["HS256"])
+            current_restaurant = Restaurant.query.get(data['restaurant_id'])
+            if not current_restaurant:
+                return jsonify({'error': 'Invalid token'}), 401
+            
+            # ⭐ ZERO-TRUST CHECK: Verify access
+            if not current_restaurant.has_active_access():
+                return jsonify({
+                    'error': 'ACCESS_DENIED',
+                    'message': 'Your subscription or trial has expired. Please renew to continue.',
+                    'subscription_status': current_restaurant.get_subscription_status()
+                }), 403
+            
+        except Exception as e:
+            return jsonify({'error': 'Invalid token'}), 401
+        
+        return f(current_restaurant, *args, **kwargs)
+    return decorated
+
+
+# =====================================================================
+# DATABASE MIGRATION
 # =====================================================================
 with app.app_context():
     db.create_all()
@@ -230,21 +343,33 @@ with app.app_context():
         columns = [col['name'] for col in inspector.get_columns('restaurant')]
         is_sqlite = 'sqlite' in str(db.engine.url)
         
+        # Add subscription fields
+        if 'subscription_start_date' not in columns:
+            with db.engine.connect() as conn:
+                if is_sqlite:
+                    conn.execute(text('ALTER TABLE restaurant ADD COLUMN subscription_start_date DATETIME'))
+                    conn.execute(text('ALTER TABLE restaurant ADD COLUMN subscription_end_date DATETIME'))
+                    conn.execute(text('ALTER TABLE restaurant ADD COLUMN grace_period_days INTEGER DEFAULT 0'))
+                else:
+                    conn.execute(text('ALTER TABLE restaurant ADD COLUMN subscription_start_date TIMESTAMP'))
+                    conn.execute(text('ALTER TABLE restaurant ADD COLUMN subscription_end_date TIMESTAMP'))
+                    conn.execute(text('ALTER TABLE restaurant ADD COLUMN grace_period_days INTEGER DEFAULT 0'))
+                conn.commit()
+            print("✅ Added subscription fields")
+        
         # Add Razorpay columns
         if 'subscription_plan' not in columns:
             with db.engine.connect() as conn:
                 if is_sqlite:
                     conn.execute(text('ALTER TABLE restaurant ADD COLUMN subscription_plan VARCHAR(20)'))
-                    conn.execute(text('ALTER TABLE restaurant ADD COLUMN subscription_expiry DATETIME'))
                     conn.execute(text('ALTER TABLE restaurant ADD COLUMN razorpay_customer_id VARCHAR(100)'))
                 else:
                     conn.execute(text('ALTER TABLE restaurant ADD COLUMN subscription_plan VARCHAR(20)'))
-                    conn.execute(text('ALTER TABLE restaurant ADD COLUMN subscription_expiry TIMESTAMP'))
                     conn.execute(text('ALTER TABLE restaurant ADD COLUMN razorpay_customer_id VARCHAR(100)'))
                 conn.commit()
             print("✅ Added Razorpay subscription columns")
         
-        # Add Google OAuth columns if not exists
+        # Add Google OAuth columns
         if 'google_id' not in columns:
             with db.engine.connect() as conn:
                 if is_sqlite:
@@ -325,7 +450,7 @@ with app.app_context():
     print("✅ Database tables created/verified!")
 
 # =====================================================================
-# AUTH DECORATOR
+# AUTH DECORATOR (For basic token validation only)
 # =====================================================================
 def token_required(f):
     @wraps(f)
@@ -352,7 +477,7 @@ def token_required(f):
     return decorated
 
 # =====================================================================
-# RAZORPAY ROUTES (NEW)
+# RAZORPAY ROUTES
 # =====================================================================
 
 @app.route('/api/create-order', methods=['POST', 'OPTIONS'])
@@ -371,7 +496,7 @@ def create_order(current_restaurant):
         plan = PLANS[plan_key]
         
         # Check if user already has active subscription
-        if current_restaurant.has_active_subscription():
+        if current_restaurant.is_subscription_active():
             return jsonify({
                 'error': 'You already have an active subscription',
                 'already_subscribed': True
@@ -461,19 +586,21 @@ def verify_payment(current_restaurant):
             transaction.razorpay_signature = razorpay_signature
             transaction.status = 'SUCCESS'
             
-            # Activate subscription
+            # ✅ Activate subscription
             plan = PLANS.get(transaction.plan)
             if plan:
+                now = datetime.utcnow()
                 current_restaurant.is_subscribed = True
                 current_restaurant.subscription_plan = transaction.plan
-                current_restaurant.subscription_expiry = datetime.utcnow() + timedelta(days=plan['duration_days'])
+                current_restaurant.subscription_start_date = now
+                current_restaurant.subscription_end_date = now + timedelta(days=plan['duration_days'])
             
             db.session.commit()
             
             return jsonify({
                 'success': True,
                 'message': 'Payment verified successfully! Subscription activated.',
-                'subscription_expiry': current_restaurant.subscription_expiry.isoformat() if current_restaurant.subscription_expiry else None
+                'subscription_end_date': current_restaurant.subscription_end_date.isoformat() if current_restaurant.subscription_end_date else None
             })
             
         except SignatureVerificationError as e:
@@ -494,24 +621,27 @@ def get_subscription_status(current_restaurant):
     if request.method == 'OPTIONS':
         return jsonify({'success': True}), 200
     
-    is_active = current_restaurant.has_active_subscription()
-    expiry = current_restaurant.subscription_expiry
+    is_active = current_restaurant.is_subscription_active()
+    has_trial = current_restaurant.is_trial_active()
     
     return jsonify({
         'success': True,
         'is_subscribed': current_restaurant.is_subscribed,
-        'has_active': is_active,
+        'has_active_subscription': is_active,
+        'has_active_trial': has_trial,
+        'has_active_access': current_restaurant.has_active_access(),
         'subscription_plan': current_restaurant.subscription_plan,
-        'subscription_expiry': expiry.isoformat() if expiry else None,
-        'days_remaining': (expiry - datetime.utcnow()).days if expiry and is_active else 0
+        'subscription_start_date': current_restaurant.subscription_start_date.isoformat() if current_restaurant.subscription_start_date else None,
+        'subscription_end_date': current_restaurant.subscription_end_date.isoformat() if current_restaurant.subscription_end_date else None,
+        'days_remaining': current_restaurant.get_subscription_days_left(),
+        'trial_days_left': current_restaurant.get_trial_days_left()
     })
 
 
 @app.route('/api/webhook/razorpay', methods=['POST'])
 def razorpay_webhook():
     """
-    Razorpay Webhook Handler
-    Called by Razorpay for async payment status updates
+    Razorpay Webhook Handler — For async payment status updates
     """
     try:
         webhook_secret = os.environ.get('RAZORPAY_WEBHOOK_SECRET')
@@ -549,9 +679,11 @@ def razorpay_webhook():
                 if restaurant:
                     plan = PLANS.get(transaction.plan)
                     if plan:
+                        now = datetime.utcnow()
                         restaurant.is_subscribed = True
                         restaurant.subscription_plan = transaction.plan
-                        restaurant.subscription_expiry = datetime.utcnow() + timedelta(days=plan['duration_days'])
+                        restaurant.subscription_start_date = now
+                        restaurant.subscription_end_date = now + timedelta(days=plan['duration_days'])
                 
                 db.session.commit()
                 print(f"✅ Webhook: Payment {payment_id} captured and subscription activated")
@@ -853,13 +985,6 @@ def login():
 @app.route('/api/me', methods=['GET', 'OPTIONS'])
 @token_required
 def get_me(current_restaurant):
-    if not current_restaurant.is_subscribed:
-        days_left = current_restaurant.get_trial_days_left()
-        is_expired = current_restaurant.is_trial_expired()
-    else:
-        days_left = None
-        is_expired = False
-        
     return jsonify({
         'id': current_restaurant.id,
         'restaurant_name': current_restaurant.restaurant_name,
@@ -870,14 +995,17 @@ def get_me(current_restaurant):
         'is_google_user': current_restaurant.is_google_user,
         'is_subscribed': current_restaurant.is_subscribed,
         'subscription_plan': current_restaurant.subscription_plan,
-        'subscription_expiry': current_restaurant.subscription_expiry.isoformat() if current_restaurant.subscription_expiry else None,
-        'has_active_subscription': current_restaurant.has_active_subscription(),
-        'trial_days_left': days_left,
-        'is_trial_expired': is_expired
+        'subscription_start_date': current_restaurant.subscription_start_date.isoformat() if current_restaurant.subscription_start_date else None,
+        'subscription_end_date': current_restaurant.subscription_end_date.isoformat() if current_restaurant.subscription_end_date else None,
+        'has_active_subscription': current_restaurant.is_subscription_active(),
+        'has_active_trial': current_restaurant.is_trial_active(),
+        'has_active_access': current_restaurant.has_active_access(),
+        'trial_days_left': current_restaurant.get_trial_days_left(),
+        'subscription_days_left': current_restaurant.get_subscription_days_left()
     })
 
 # =====================================================================
-# TRIAL & SUBSCRIPTION ROUTES
+# TRIAL & SUBSCRIPTION ROUTES (UPDATED)
 # =====================================================================
 
 @app.route('/api/trial-status', methods=['GET', 'OPTIONS'])
@@ -886,19 +1014,18 @@ def get_trial_status(current_restaurant):
     if request.method == 'OPTIONS':
         return jsonify({'success': True}), 200
     
-    days_left = current_restaurant.get_trial_days_left()
-    is_expired = current_restaurant.is_trial_expired()
-    has_active = current_restaurant.has_active_subscription()
-    
     return jsonify({
         'success': True,
         'trial_start_date': current_restaurant.trial_start_date.isoformat() if current_restaurant.trial_start_date else None,
-        'remaining_days': days_left,
+        'trial_days_left': current_restaurant.get_trial_days_left(),
+        'is_trial_active': current_restaurant.is_trial_active(),
+        'is_trial_expired': current_restaurant.is_trial_expired(),
         'is_subscribed': current_restaurant.is_subscribed,
-        'has_active_subscription': has_active,
-        'is_expired': is_expired,
-        'trial_duration_days': 14,
-        'subscription_expiry': current_restaurant.subscription_expiry.isoformat() if current_restaurant.subscription_expiry else None
+        'has_active_subscription': current_restaurant.is_subscription_active(),
+        'has_active_access': current_restaurant.has_active_access(),
+        'subscription_end_date': current_restaurant.subscription_end_date.isoformat() if current_restaurant.subscription_end_date else None,
+        'subscription_days_left': current_restaurant.get_subscription_days_left(),
+        'trial_duration_days': 14
     })
 
 @app.route('/api/subscribe', methods=['POST', 'OPTIONS'])
@@ -907,6 +1034,7 @@ def subscribe_restaurant(current_restaurant):
     if request.method == 'OPTIONS':
         return jsonify({'success': True}), 200
     
+    # This is for manual subscription (if needed)
     current_restaurant.is_subscribed = True
     db.session.commit()
     
@@ -916,17 +1044,14 @@ def subscribe_restaurant(current_restaurant):
     })
 
 # =====================================================================
-# PROFILE & MENU ROUTES
+# PROFILE & MENU ROUTES (WITH LOCKOUT)
 # =====================================================================
 
 @app.route('/api/profile', methods=['PUT', 'OPTIONS'])
-@token_required
+@require_active_access  # ⭐ LOCKOUT: Requires active trial OR subscription
 def update_profile(current_restaurant):
     if request.method == 'OPTIONS':
         return jsonify({'success': True}), 200
-    
-    if not current_restaurant.has_active_subscription() and current_restaurant.is_trial_expired():
-        return jsonify({'error': 'Trial expired. Please subscribe to continue.'}), 403
     
     data = request.get_json()
     if 'restaurant_name' in data: 
@@ -940,14 +1065,10 @@ def update_profile(current_restaurant):
     return jsonify({'success': True})
 
 @app.route('/api/menu-items', methods=['GET', 'POST', 'OPTIONS'])
-@token_required
+@require_active_access  # ⭐ LOCKOUT: Requires active trial OR subscription
 def handle_menu_items(current_restaurant):
     if request.method == 'OPTIONS':
         return jsonify({'success': True}), 200
-    
-    if not current_restaurant.has_active_subscription() and current_restaurant.is_trial_expired():
-        if request.method == 'POST':
-            return jsonify({'error': 'Trial expired. Please subscribe to continue.'}), 403
     
     if request.method == 'GET':
         items = MenuItem.query.filter_by(restaurant_id=current_restaurant.id).all()
@@ -979,13 +1100,10 @@ def handle_menu_items(current_restaurant):
         return jsonify({'success': True, 'item': {'id': item.id}}), 201
 
 @app.route('/api/menu/toggle/<int:item_id>', methods=['PUT', 'OPTIONS'])
-@token_required
+@require_active_access  # ⭐ LOCKOUT: Requires active trial OR subscription
 def toggle_item_status(current_restaurant, item_id):
     if request.method == 'OPTIONS':
         return jsonify({'success': True}), 200
-    
-    if not current_restaurant.has_active_subscription() and current_restaurant.is_trial_expired():
-        return jsonify({'error': 'Trial expired. Please subscribe to continue.'}), 403
     
     item = MenuItem.query.filter_by(id=item_id, restaurant_id=current_restaurant.id).first()
     if not item:
@@ -997,13 +1115,10 @@ def toggle_item_status(current_restaurant, item_id):
     return jsonify({'success': True, 'is_active': item.is_active})
 
 @app.route('/api/menu-items/<int:item_id>', methods=['PUT', 'DELETE', 'OPTIONS'])
-@token_required
+@require_active_access  # ⭐ LOCKOUT: Requires active trial OR subscription
 def update_delete_item(current_restaurant, item_id):
     if request.method == 'OPTIONS':
         return jsonify({'success': True}), 200
-    
-    if not current_restaurant.has_active_subscription() and current_restaurant.is_trial_expired():
-        return jsonify({'error': 'Trial expired. Please subscribe to continue.'}), 403
     
     item = MenuItem.query.filter_by(id=item_id, restaurant_id=current_restaurant.id).first()
     if not item:
@@ -1027,11 +1142,11 @@ def update_delete_item(current_restaurant, item_id):
         return jsonify({'success': True})
 
 # =====================================================================
-# QR CODE GENERATION — HIGH RESOLUTION
+# QR CODE GENERATION (WITH LOCKOUT)
 # =====================================================================
 
 @app.route('/api/generate-qr', methods=['POST', 'OPTIONS'])
-@token_required
+@require_active_access  # ⭐ LOCKOUT: Requires active trial OR subscription
 def generate_qr(current_restaurant):
     if request.method == 'OPTIONS':
         return jsonify({'success': True}), 200
@@ -1072,18 +1187,32 @@ def generate_qr(current_restaurant):
         return jsonify({'error': str(e)}), 500
 
 # =====================================================================
-# PUBLIC MENU
+# PUBLIC MENU (⭐ ZERO-TRUST ENFORCEMENT)
 # =====================================================================
 
 @app.route('/api/menu/<int:restaurant_id>', methods=['GET', 'OPTIONS'])
 def get_public_menu(restaurant_id):
+    """
+    ⭐ ZERO-TRUST PUBLIC MENU API
+    Returns 403 FORBIDDEN if subscription is expired
+    """
     if request.method == 'OPTIONS':
         return jsonify({'success': True}), 200
     
+    # 1. Get restaurant
     restaurant = Restaurant.query.get(restaurant_id)
     if not restaurant:
         return jsonify({'error': 'Restaurant not found'}), 404
     
+    # 2. ⭐ ZERO-TRUST CHECK: Verify active access
+    if not restaurant.has_active_access():
+        return jsonify({
+            'error': 'SUBSCRIPTION_EXPIRED',
+            'message': 'This menu is currently inactive.',
+            'subscription_status': restaurant.get_subscription_status()
+        }), 403
+    
+    # 3. ✅ Access granted — Return menu items
     items = MenuItem.query.filter_by(
         restaurant_id=restaurant_id, 
         is_active=True
@@ -1102,7 +1231,8 @@ def get_public_menu(restaurant_id):
         'restaurant_name': restaurant.restaurant_name,
         'upi_id': restaurant.upi_id,
         'logo_url': restaurant.logo_url,
-        'items': items_data
+        'items': items_data,
+        'subscription_status': 'ACTIVE'
     }
     
     return jsonify(response_data)
