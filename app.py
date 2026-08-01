@@ -75,6 +75,9 @@ GOOGLE_CLIENT_ID = os.environ.get('GOOGLE_CLIENT_ID')
 GOOGLE_CLIENT_SECRET = os.environ.get('GOOGLE_CLIENT_SECRET')
 APP_BASE_URL = os.environ.get('APP_BASE_URL', 'http://localhost:5000')
 
+# Get FRONTEND_URL from environment
+FRONTEND_URL = os.environ.get('FRONTEND_URL', 'https://codewithahmed2005.github.io/ScanEats')
+
 # Google OAuth URLs
 GOOGLE_AUTH_URL = "https://accounts.google.com/o/oauth2/auth"
 GOOGLE_TOKEN_URL = "https://oauth2.googleapis.com/token"
@@ -163,11 +166,10 @@ class Restaurant(db.Model):
         return check_password_hash(self.password_hash, password)
     
     # =============================================================
-    # SUBSCRIPTION STATUS HELPER FUNCTIONS (NEW)
+    # SUBSCRIPTION STATUS HELPER FUNCTIONS
     # =============================================================
     
     def is_trial_active(self):
-        """Check if trial is still active"""
         if not self.trial_start_date:
             return False
         today = datetime.utcnow().replace(hour=0, minute=0, second=0, microsecond=0)
@@ -175,7 +177,6 @@ class Restaurant(db.Model):
         return today <= trial_end
     
     def get_trial_days_left(self):
-        """Calculate remaining trial days"""
         if self.is_subscribed:
             return None
         if not self.trial_start_date:
@@ -186,68 +187,41 @@ class Restaurant(db.Model):
         return max(0, days_left)
     
     def is_trial_expired(self):
-        """Check if trial is expired"""
         if self.is_subscribed:
             return False
         days_left = self.get_trial_days_left()
         return days_left == 0
     
-    # =============================================================
-    # SUBSCRIPTION ACTIVE CHECK (ZERO-TRUST)
-    # =============================================================
-    
     def is_subscription_active(self):
-        """
-        ⭐ CRITICAL: Zero-trust subscription check
-        Returns True only if subscription is ACTIVE and NOT expired
-        """
-        # 1. Check if user has paid subscription
         if not self.is_subscribed:
             return False
-        
-        # 2. Check if subscription_end_date exists
         if not self.subscription_end_date:
             return False
-        
-        # 3. Check if current time is within subscription period
         now = datetime.utcnow()
         return now <= self.subscription_end_date
     
     def get_subscription_status(self):
-        """Get detailed subscription status"""
         if not self.is_subscribed:
             return 'TRIAL'
-        
         if self.is_subscription_active():
             return 'ACTIVE'
         else:
             return 'EXPIRED'
     
     def get_subscription_days_left(self):
-        """Get days remaining in subscription"""
         if not self.is_subscribed or not self.subscription_end_date:
             return 0
-        
         now = datetime.utcnow()
         if now > self.subscription_end_date:
             return 0
-        
         days_left = (self.subscription_end_date - now).days
         return max(0, days_left)
     
     def has_active_access(self):
-        """
-        ⭐ Master access check — used by ALL routes
-        Returns True if trial is active OR subscription is active
-        """
-        # Check paid subscription first
         if self.is_subscription_active():
             return True
-        
-        # Check trial if not subscribed
         if not self.is_subscribed and self.is_trial_active():
             return True
-        
         return False
 
 
@@ -291,21 +265,15 @@ class MenuItem(db.Model):
 
 
 # =====================================================================
-# SUBSCRIPTION LOCKOUT DECORATOR (NEW)
+# SUBSCRIPTION LOCKOUT DECORATOR
 # =====================================================================
 
 def require_active_access(f):
-    """
-    ⭐ ZERO-TRUST DECORATOR
-    Use this on ANY route that requires an active subscription or trial
-    """
     @wraps(f)
     def decorated(*args, **kwargs):
-        # Skip for OPTIONS requests
         if request.method == 'OPTIONS':
             return jsonify({'success': True}), 200
         
-        # Get token
         token = None
         if 'Authorization' in request.headers:
             token = request.headers['Authorization'].split(" ")[1]
@@ -319,7 +287,6 @@ def require_active_access(f):
             if not current_restaurant:
                 return jsonify({'error': 'Invalid token'}), 401
             
-            # ⭐ ZERO-TRUST CHECK: Verify access
             if not current_restaurant.has_active_access():
                 return jsonify({
                     'error': 'ACCESS_DENIED',
@@ -345,7 +312,6 @@ with app.app_context():
         columns = [col['name'] for col in inspector.get_columns('restaurant')]
         is_sqlite = 'sqlite' in str(db.engine.url)
         
-        # Add subscription fields
         if 'subscription_start_date' not in columns:
             with db.engine.connect() as conn:
                 if is_sqlite:
@@ -359,7 +325,6 @@ with app.app_context():
                 conn.commit()
             print("✅ Added subscription fields")
         
-        # Add Razorpay columns
         if 'subscription_plan' not in columns:
             with db.engine.connect() as conn:
                 if is_sqlite:
@@ -371,7 +336,6 @@ with app.app_context():
                 conn.commit()
             print("✅ Added Razorpay subscription columns")
         
-        # Add Google OAuth columns
         if 'google_id' not in columns:
             with db.engine.connect() as conn:
                 if is_sqlite:
@@ -452,7 +416,7 @@ with app.app_context():
     print("✅ Database tables created/verified!")
 
 # =====================================================================
-# AUTH DECORATOR (For basic token validation only)
+# AUTH DECORATOR
 # =====================================================================
 def token_required(f):
     @wraps(f)
@@ -497,14 +461,12 @@ def create_order(current_restaurant):
         
         plan = PLANS[plan_key]
         
-        # Check if user already has active subscription
         if current_restaurant.is_subscription_active():
             return jsonify({
                 'error': 'You already have an active subscription',
                 'already_subscribed': True
             }), 400
         
-        # Create Razorpay Order
         order_data = {
             'amount': plan['amount'],
             'currency': plan['currency'],
@@ -519,7 +481,6 @@ def create_order(current_restaurant):
         
         order = razorpay_client.order.create(data=order_data)
         
-        # Save transaction to database
         transaction = PaymentTransaction(
             restaurant_id=current_restaurant.id,
             razorpay_order_id=order['id'],
@@ -561,7 +522,6 @@ def verify_payment(current_restaurant):
         if not all([razorpay_order_id, razorpay_payment_id, razorpay_signature]):
             return jsonify({'error': 'Missing payment details'}), 400
         
-        # Find transaction
         transaction = PaymentTransaction.query.filter_by(
             razorpay_order_id=razorpay_order_id,
             restaurant_id=current_restaurant.id
@@ -573,9 +533,6 @@ def verify_payment(current_restaurant):
         if transaction.status == 'SUCCESS':
             return jsonify({'error': 'Payment already verified'}), 400
         
-        # =============================================================
-        # VERIFY HMAC SHA256 SIGNATURE
-        # =============================================================
         try:
             razorpay_client.utility.verify_payment_signature({
                 'razorpay_order_id': razorpay_order_id,
@@ -583,12 +540,10 @@ def verify_payment(current_restaurant):
                 'razorpay_signature': razorpay_signature
             })
             
-            # ✅ Signature verified successfully
             transaction.razorpay_payment_id = razorpay_payment_id
             transaction.razorpay_signature = razorpay_signature
             transaction.status = 'SUCCESS'
             
-            # ✅ Activate subscription
             plan = PLANS.get(transaction.plan)
             if plan:
                 now = datetime.utcnow()
@@ -606,7 +561,6 @@ def verify_payment(current_restaurant):
             })
             
         except SignatureVerificationError as e:
-            # ❌ Invalid signature
             transaction.status = 'FAILED'
             db.session.commit()
             print(f"❌ Signature verification failed: {str(e)}")
@@ -642,13 +596,9 @@ def get_subscription_status(current_restaurant):
 
 @app.route('/api/webhook/razorpay', methods=['POST'])
 def razorpay_webhook():
-    """
-    Razorpay Webhook Handler — For async payment status updates
-    """
     try:
         webhook_secret = os.environ.get('RAZORPAY_WEBHOOK_SECRET')
         
-        # Verify webhook signature
         received_signature = request.headers.get('X-Razorpay-Signature')
         if webhook_secret and received_signature:
             expected_signature = hmac.new(
@@ -670,13 +620,11 @@ def razorpay_webhook():
             order_id = payment_data.get('order_id')
             payment_id = payment_data.get('id')
             
-            # Find transaction
             transaction = PaymentTransaction.query.filter_by(razorpay_order_id=order_id).first()
             if transaction and transaction.status == 'PENDING':
                 transaction.razorpay_payment_id = payment_id
                 transaction.status = 'SUCCESS'
                 
-                # Activate subscription
                 restaurant = Restaurant.query.get(transaction.restaurant_id)
                 if restaurant:
                     plan = PLANS.get(transaction.plan)
@@ -707,7 +655,7 @@ def razorpay_webhook():
         return jsonify({'error': str(e)}), 500
 
 # =====================================================================
-# GOOGLE OATH ROUTES
+# ⭐ GOOGLE OATH ROUTES (FIXED)
 # =====================================================================
 
 @app.route('/api/auth/google', methods=['GET'])
@@ -726,7 +674,7 @@ def google_login():
         return redirect(auth_url)
     except Exception as e:
         print(f"Google Auth Error: {str(e)}")
-        return redirect(f"{APP_BASE_URL}/auth.html?error=google_auth_failed")
+        return redirect(f"{FRONTEND_URL}/auth.html?error=google_auth_failed")
 
 
 @app.route('/api/auth/google/callback', methods=['GET'])
@@ -735,11 +683,12 @@ def google_callback():
         code = request.args.get('code')
         error = request.args.get('error')
         
+        # ⭐ FIX: Use FRONTEND_URL for redirects
         if error:
-            return redirect(f"{APP_BASE_URL}/auth.html?error=google_auth_failed")
+            return redirect(f"{FRONTEND_URL}/auth.html?error=google_auth_failed")
         
         if not code:
-            return redirect(f"{APP_BASE_URL}/auth.html?error=no_code")
+            return redirect(f"{FRONTEND_URL}/auth.html?error=no_code")
         
         redirect_uri = f"{APP_BASE_URL}/api/auth/google/callback"
         token_data = {
@@ -754,7 +703,7 @@ def google_callback():
         
         if 'access_token' not in token_json:
             print(f"Token error: {token_json}")
-            return redirect(f"{APP_BASE_URL}/auth.html?error=token_failed")
+            return redirect(f"{FRONTEND_URL}/auth.html?error=token_failed")
         
         access_token = token_json['access_token']
         userinfo_response = requests.get(
@@ -764,7 +713,7 @@ def google_callback():
         userinfo = userinfo_response.json()
         
         if 'email' not in userinfo:
-            return redirect(f"{APP_BASE_URL}/auth.html?error=no_email")
+            return redirect(f"{FRONTEND_URL}/auth.html?error=no_email")
         
         email = userinfo['email']
         name = userinfo.get('name', '')
@@ -808,12 +757,12 @@ def google_callback():
             'exp': datetime.utcnow() + timedelta(days=30)
         }, app.config['SECRET_KEY'], algorithm="HS256")
         
-        frontend_url = os.environ.get('FRONTEND_URL', 'https://codewithahmed2005.github.io/ScanEats')
-        return redirect(f"{frontend_url}/auth.html?token={token}&google_auth=success")
+        # ⭐ FIX: Use FRONTEND_URL for success redirect
+        return redirect(f"{FRONTEND_URL}/auth.html?token={token}&google_auth=success")
         
     except Exception as e:
         print(f"Google Callback Error: {str(e)}")
-        return redirect(f"{APP_BASE_URL}/auth.html?error=google_auth_failed")
+        return redirect(f"{FRONTEND_URL}/auth.html?error=google_auth_failed")
 
 
 @app.route('/api/auth/google/status', methods=['GET'])
@@ -843,7 +792,7 @@ def get_web3forms_key():
     })
 
 # =====================================================================
-# CONTACT FORM API (Web3Forms Proxy)
+# CONTACT FORM API
 # =====================================================================
 
 @app.route('/api/contact', methods=['POST', 'OPTIONS'])
@@ -1007,7 +956,7 @@ def get_me(current_restaurant):
     })
 
 # =====================================================================
-# TRIAL & SUBSCRIPTION ROUTES (UPDATED)
+# TRIAL & SUBSCRIPTION ROUTES
 # =====================================================================
 
 @app.route('/api/trial-status', methods=['GET', 'OPTIONS'])
@@ -1036,7 +985,6 @@ def subscribe_restaurant(current_restaurant):
     if request.method == 'OPTIONS':
         return jsonify({'success': True}), 200
     
-    # This is for manual subscription (if needed)
     current_restaurant.is_subscribed = True
     db.session.commit()
     
@@ -1050,7 +998,7 @@ def subscribe_restaurant(current_restaurant):
 # =====================================================================
 
 @app.route('/api/profile', methods=['PUT', 'OPTIONS'])
-@require_active_access  # ⭐ LOCKOUT: Requires active trial OR subscription
+@require_active_access
 def update_profile(current_restaurant):
     if request.method == 'OPTIONS':
         return jsonify({'success': True}), 200
@@ -1067,7 +1015,7 @@ def update_profile(current_restaurant):
     return jsonify({'success': True})
 
 @app.route('/api/menu-items', methods=['GET', 'POST', 'OPTIONS'])
-@require_active_access  # ⭐ LOCKOUT: Requires active trial OR subscription
+@require_active_access
 def handle_menu_items(current_restaurant):
     if request.method == 'OPTIONS':
         return jsonify({'success': True}), 200
@@ -1102,7 +1050,7 @@ def handle_menu_items(current_restaurant):
         return jsonify({'success': True, 'item': {'id': item.id}}), 201
 
 @app.route('/api/menu/toggle/<int:item_id>', methods=['PUT', 'OPTIONS'])
-@require_active_access  # ⭐ LOCKOUT: Requires active trial OR subscription
+@require_active_access
 def toggle_item_status(current_restaurant, item_id):
     if request.method == 'OPTIONS':
         return jsonify({'success': True}), 200
@@ -1117,7 +1065,7 @@ def toggle_item_status(current_restaurant, item_id):
     return jsonify({'success': True, 'is_active': item.is_active})
 
 @app.route('/api/menu-items/<int:item_id>', methods=['PUT', 'DELETE', 'OPTIONS'])
-@require_active_access  # ⭐ LOCKOUT: Requires active trial OR subscription
+@require_active_access
 def update_delete_item(current_restaurant, item_id):
     if request.method == 'OPTIONS':
         return jsonify({'success': True}), 200
@@ -1144,17 +1092,16 @@ def update_delete_item(current_restaurant, item_id):
         return jsonify({'success': True})
 
 # =====================================================================
-# QR CODE GENERATION (WITH LOCKOUT)
+# QR CODE GENERATION
 # =====================================================================
 
 @app.route('/api/generate-qr', methods=['POST', 'OPTIONS'])
-@require_active_access  # ⭐ LOCKOUT: Requires active trial OR subscription
+@require_active_access
 def generate_qr(current_restaurant):
     if request.method == 'OPTIONS':
         return jsonify({'success': True}), 200
     
     try:
-        FRONTEND_URL = os.environ.get('FRONTEND_URL', 'https://codewithahmed2005.github.io/ScanEats')
         menu_url = f"{FRONTEND_URL}/menu.html?id={current_restaurant.id}"
         
         qr = qrcode.QRCode(
@@ -1189,24 +1136,18 @@ def generate_qr(current_restaurant):
         return jsonify({'error': str(e)}), 500
 
 # =====================================================================
-# PUBLIC MENU (⭐ ZERO-TRUST ENFORCEMENT)
+# PUBLIC MENU
 # =====================================================================
 
 @app.route('/api/menu/<int:restaurant_id>', methods=['GET', 'OPTIONS'])
 def get_public_menu(restaurant_id):
-    """
-    ⭐ ZERO-TRUST PUBLIC MENU API
-    Returns 403 FORBIDDEN if subscription is expired
-    """
     if request.method == 'OPTIONS':
         return jsonify({'success': True}), 200
     
-    # 1. Get restaurant
     restaurant = Restaurant.query.get(restaurant_id)
     if not restaurant:
         return jsonify({'error': 'Restaurant not found'}), 404
     
-    # 2. ⭐ ZERO-TRUST CHECK: Verify active access
     if not restaurant.has_active_access():
         return jsonify({
             'error': 'SUBSCRIPTION_EXPIRED',
@@ -1214,7 +1155,6 @@ def get_public_menu(restaurant_id):
             'subscription_status': restaurant.get_subscription_status()
         }), 403
     
-    # 3. ✅ Access granted — Return menu items
     items = MenuItem.query.filter_by(
         restaurant_id=restaurant_id, 
         is_active=True
