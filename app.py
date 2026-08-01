@@ -1,4 +1,6 @@
 import os
+import hmac
+import hashlib
 import qrcode
 import base64
 import jwt
