@@ -312,6 +312,19 @@ with app.app_context():
         columns = [col['name'] for col in inspector.get_columns('restaurant')]
         is_sqlite = 'sqlite' in str(db.engine.url)
         
+        # ✅ FIX: Make password_hash nullable if not already
+        if not is_sqlite:
+            with db.engine.connect() as conn:
+                # Check if column is nullable
+                result = conn.execute(text("""
+                    SELECT is_nullable FROM information_schema.columns 
+                    WHERE table_name = 'restaurant' AND column_name = 'password_hash'
+                """)).fetchone()
+                if result and result[0] == 'NO':
+                    conn.execute(text('ALTER TABLE restaurant ALTER COLUMN password_hash DROP NOT NULL'))
+                    conn.commit()
+                    print("✅ Made password_hash nullable")
+        
         if 'subscription_start_date' not in columns:
             with db.engine.connect() as conn:
                 if is_sqlite:
@@ -655,7 +668,7 @@ def razorpay_webhook():
         return jsonify({'error': str(e)}), 500
 
 # =====================================================================
-# ⭐ GOOGLE OATH ROUTES (FIXED)
+# ⭐ GOOGLE OATH ROUTES (FIXED - password_hash)
 # =====================================================================
 
 @app.route('/api/auth/google', methods=['GET'])
@@ -735,10 +748,16 @@ def google_callback():
                 user.trial_start_date = now
                 db.session.commit()
         else:
+            # ⭐ NEW USER: Set dummy password_hash
             now = datetime.utcnow().replace(hour=0, minute=0, second=0, microsecond=0)
             restaurant_name = email.split('@')[0].replace('.', ' ').title()
             if not restaurant_name:
                 restaurant_name = "My Restaurant"
+            
+            # ✅ Generate dummy password hash for Google users
+            dummy_password = f"google_{google_id}_{email}"
+            dummy_hash = generate_password_hash(dummy_password)
+            
             user = Restaurant(
                 email=email,
                 owner_name=name or restaurant_name,
@@ -747,7 +766,8 @@ def google_callback():
                 is_google_user=True,
                 profile_picture=profile_picture,
                 trial_start_date=now,
-                is_subscribed=False
+                is_subscribed=False,
+                password_hash=dummy_hash  # ✅ Dummy password hash
             )
             db.session.add(user)
             db.session.commit()
