@@ -49,7 +49,7 @@ razorpay_client = razorpay.Client(auth=(RAZORPAY_KEY_ID, RAZORPAY_KEY_SECRET))
 # Plan Configuration
 PLANS = {
     '3_months': {
-        'amount': 100,
+        'amount': 49900,
         'currency': 'INR',
         'duration_days': 90,
         'name': '3 Months Plan'
@@ -124,7 +124,7 @@ CORS(app,
 db = SQLAlchemy(app)
 
 # =====================================================================
-# DATABASE MODELS (UPDATED)
+# DATABASE MODELS
 # =====================================================================
 
 class Restaurant(db.Model):
@@ -312,10 +312,9 @@ with app.app_context():
         columns = [col['name'] for col in inspector.get_columns('restaurant')]
         is_sqlite = 'sqlite' in str(db.engine.url)
         
-        # ✅ FIX: Make password_hash nullable if not already
+        # Make password_hash nullable if not already
         if not is_sqlite:
             with db.engine.connect() as conn:
-                # Check if column is nullable
                 result = conn.execute(text("""
                     SELECT is_nullable FROM information_schema.columns 
                     WHERE table_name = 'restaurant' AND column_name = 'password_hash'
@@ -547,16 +546,31 @@ def verify_payment(current_restaurant):
             return jsonify({'error': 'Payment already verified'}), 400
         
         try:
+            # 1. Verify signature
             razorpay_client.utility.verify_payment_signature({
                 'razorpay_order_id': razorpay_order_id,
                 'razorpay_payment_id': razorpay_payment_id,
                 'razorpay_signature': razorpay_signature
             })
             
+            # 2. ⭐ Verify payment status from Razorpay
+            payment_details = razorpay_client.payment.fetch(razorpay_payment_id)
+            
+            if payment_details.get('status') != 'captured':
+                transaction.status = 'FAILED'
+                db.session.commit()
+                print(f"❌ Payment not captured: {payment_details.get('status')}")
+                return jsonify({
+                    'error': 'Payment not captured. Please try again.',
+                    'payment_status': payment_details.get('status')
+                }), 400
+            
+            # 3. ✅ All checks passed — Activate subscription
             transaction.razorpay_payment_id = razorpay_payment_id
             transaction.razorpay_signature = razorpay_signature
             transaction.status = 'SUCCESS'
             
+            # ⭐ FIX: Set subscription_end_date
             plan = PLANS.get(transaction.plan)
             if plan:
                 now = datetime.utcnow()
@@ -633,6 +647,11 @@ def razorpay_webhook():
             order_id = payment_data.get('order_id')
             payment_id = payment_data.get('id')
             
+            # ⭐ Check payment status from webhook
+            if payment_data.get('status') != 'captured':
+                print(f"⚠️ Payment not captured: {payment_data.get('status')}")
+                return jsonify({'success': False, 'error': 'Payment not captured'}), 400
+            
             transaction = PaymentTransaction.query.filter_by(razorpay_order_id=order_id).first()
             if transaction and transaction.status == 'PENDING':
                 transaction.razorpay_payment_id = payment_id
@@ -650,13 +669,15 @@ def razorpay_webhook():
                 
                 db.session.commit()
                 print(f"✅ Webhook: Payment {payment_id} captured and subscription activated")
+            else:
+                print(f"⚠️ Transaction not found or already processed: {order_id}")
         
         elif event_type == 'payment.failed':
             payment_data = event_data.get('payload', {}).get('payment', {}).get('entity', {})
             order_id = payment_data.get('order_id')
             
             transaction = PaymentTransaction.query.filter_by(razorpay_order_id=order_id).first()
-            if transaction:
+            if transaction and transaction.status == 'PENDING':
                 transaction.status = 'FAILED'
                 db.session.commit()
                 print(f"❌ Webhook: Payment {order_id} failed")
@@ -668,7 +689,7 @@ def razorpay_webhook():
         return jsonify({'error': str(e)}), 500
 
 # =====================================================================
-# ⭐ GOOGLE OATH ROUTES (FIXED - password_hash)
+# GOOGLE OATH ROUTES
 # =====================================================================
 
 @app.route('/api/auth/google', methods=['GET'])
@@ -696,7 +717,6 @@ def google_callback():
         code = request.args.get('code')
         error = request.args.get('error')
         
-        # ⭐ FIX: Use FRONTEND_URL for redirects
         if error:
             return redirect(f"{FRONTEND_URL}/auth.html?error=google_auth_failed")
         
@@ -748,13 +768,11 @@ def google_callback():
                 user.trial_start_date = now
                 db.session.commit()
         else:
-            # ⭐ NEW USER: Set dummy password_hash
             now = datetime.utcnow().replace(hour=0, minute=0, second=0, microsecond=0)
             restaurant_name = email.split('@')[0].replace('.', ' ').title()
             if not restaurant_name:
                 restaurant_name = "My Restaurant"
             
-            # ✅ Generate dummy password hash for Google users
             dummy_password = f"google_{google_id}_{email}"
             dummy_hash = generate_password_hash(dummy_password)
             
@@ -767,7 +785,7 @@ def google_callback():
                 profile_picture=profile_picture,
                 trial_start_date=now,
                 is_subscribed=False,
-                password_hash=dummy_hash  # ✅ Dummy password hash
+                password_hash=dummy_hash
             )
             db.session.add(user)
             db.session.commit()
@@ -777,7 +795,6 @@ def google_callback():
             'exp': datetime.utcnow() + timedelta(days=30)
         }, app.config['SECRET_KEY'], algorithm="HS256")
         
-        # ⭐ FIX: Use FRONTEND_URL for success redirect
         return redirect(f"{FRONTEND_URL}/auth.html?token={token}&google_auth=success")
         
     except Exception as e:
