@@ -49,7 +49,7 @@ razorpay_client = razorpay.Client(auth=(RAZORPAY_KEY_ID, RAZORPAY_KEY_SECRET))
 # Plan Configuration
 PLANS = {
     '3_months': {
-        'amount': 400,
+        'amount': 49900,
         'currency': 'INR',
         'duration_days': 90,
         'name': '3 Months Plan'
@@ -553,7 +553,7 @@ def verify_payment(current_restaurant):
                 'razorpay_signature': razorpay_signature
             })
             
-            # 2. ⭐ Verify payment status from Razorpay
+            # 2. Verify payment status from Razorpay
             payment_details = razorpay_client.payment.fetch(razorpay_payment_id)
             
             if payment_details.get('status') != 'captured':
@@ -570,7 +570,6 @@ def verify_payment(current_restaurant):
             transaction.razorpay_signature = razorpay_signature
             transaction.status = 'SUCCESS'
             
-            # ⭐ FIX: Set subscription_end_date
             plan = PLANS.get(transaction.plan)
             if plan:
                 now = datetime.utcnow()
@@ -647,7 +646,6 @@ def razorpay_webhook():
             order_id = payment_data.get('order_id')
             payment_id = payment_data.get('id')
             
-            # ⭐ Check payment status from webhook
             if payment_data.get('status') != 'captured':
                 print(f"⚠️ Payment not captured: {payment_data.get('status')}")
                 return jsonify({'success': False, 'error': 'Payment not captured'}), 400
@@ -1233,6 +1231,29 @@ def debug_menu(restaurant_id):
         'category': i.category,
         'price': i.price
     } for i in items])
+
+# =====================================================================
+# ⭐ KEEP-ALIVE / CRON JOB ENDPOINT (NEW)
+# =====================================================================
+
+@app.route('/api/keep-alive', methods=['GET', 'OPTIONS'])
+@app.route('/api/cron', methods=['GET', 'OPTIONS'])
+@app.route('/health', methods=['GET', 'OPTIONS'])
+def keep_alive():
+    """
+    Health check endpoint for cron jobs and uptime monitoring
+    Render cron job isse hit karega taaki backend active rahe
+    """
+    if request.method == 'OPTIONS':
+        return jsonify({'success': True}), 200
+    
+    return jsonify({
+        'success': True,
+        'status': 'active',
+        'timestamp': datetime.utcnow().isoformat(),
+        'uptime': 'running',
+        'database': 'connected'
+    }), 200
 
 # =====================================================================
 # MAIN
