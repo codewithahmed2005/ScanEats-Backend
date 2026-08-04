@@ -455,7 +455,7 @@ def token_required(f):
     return decorated
 
 # =====================================================================
-# RAZORPAY ROUTES
+# RAZORPAY ROUTES (SECURE)
 # =====================================================================
 
 @app.route('/api/create-order', methods=['POST', 'OPTIONS'])
@@ -542,20 +542,25 @@ def verify_payment(current_restaurant):
         if not transaction:
             return jsonify({'error': 'Transaction not found'}), 404
         
+        # ⭐ SECURITY: Check if already processed
         if transaction.status == 'SUCCESS':
             return jsonify({'error': 'Payment already verified'}), 400
         
+        if transaction.status == 'CANCELLED':
+            return jsonify({'error': 'Payment was cancelled'}), 400
+        
         try:
-            # 1. Verify signature
+            # ⭐ SECURITY: Verify signature
             razorpay_client.utility.verify_payment_signature({
                 'razorpay_order_id': razorpay_order_id,
                 'razorpay_payment_id': razorpay_payment_id,
                 'razorpay_signature': razorpay_signature
             })
             
-            # 2. Verify payment status from Razorpay
+            # ⭐ SECURITY: Verify payment status from Razorpay
             payment_details = razorpay_client.payment.fetch(razorpay_payment_id)
             
+            # ⭐ SECURITY: Only allow if payment is captured
             if payment_details.get('status') != 'captured':
                 transaction.status = 'FAILED'
                 db.session.commit()
@@ -565,11 +570,12 @@ def verify_payment(current_restaurant):
                     'payment_status': payment_details.get('status')
                 }), 400
             
-            # 3. ✅ All checks passed — Activate subscription
+            # ✅ All security checks passed — Activate subscription
             transaction.razorpay_payment_id = razorpay_payment_id
             transaction.razorpay_signature = razorpay_signature
             transaction.status = 'SUCCESS'
             
+            # ⭐ Set subscription expiry
             plan = PLANS.get(transaction.plan)
             if plan:
                 now = datetime.utcnow()
@@ -594,6 +600,44 @@ def verify_payment(current_restaurant):
             
     except Exception as e:
         print(f"❌ Payment verification error: {str(e)}")
+        return jsonify({'error': str(e)}), 500
+
+
+@app.route('/api/cancel-payment', methods=['POST', 'OPTIONS'])
+@token_required
+def cancel_payment(current_restaurant):
+    """⭐ NEW: Cancel payment route — Prevents auto-activation"""
+    if request.method == 'OPTIONS':
+        return jsonify({'success': True}), 200
+    
+    try:
+        data = request.get_json()
+        order_id = data.get('order_id')
+        
+        if not order_id:
+            return jsonify({'error': 'Order ID required'}), 400
+        
+        transaction = PaymentTransaction.query.filter_by(
+            razorpay_order_id=order_id,
+            restaurant_id=current_restaurant.id
+        ).first()
+        
+        if not transaction:
+            return jsonify({'error': 'Transaction not found'}), 404
+        
+        if transaction.status == 'PENDING':
+            transaction.status = 'CANCELLED'
+            db.session.commit()
+            print(f"✅ Payment cancelled: {order_id}")
+        elif transaction.status == 'CANCELLED':
+            return jsonify({'success': True, 'message': 'Already cancelled'})
+        else:
+            return jsonify({'error': 'Cannot cancel transaction with status: ' + transaction.status}), 400
+        
+        return jsonify({'success': True, 'message': 'Payment cancelled'})
+        
+    except Exception as e:
+        print(f"❌ Cancel payment error: {str(e)}")
         return jsonify({'error': str(e)}), 500
 
 
@@ -646,6 +690,7 @@ def razorpay_webhook():
             order_id = payment_data.get('order_id')
             payment_id = payment_data.get('id')
             
+            # ⭐ SECURITY: Check payment status
             if payment_data.get('status') != 'captured':
                 print(f"⚠️ Payment not captured: {payment_data.get('status')}")
                 return jsonify({'success': False, 'error': 'Payment not captured'}), 400
@@ -1233,17 +1278,13 @@ def debug_menu(restaurant_id):
     } for i in items])
 
 # =====================================================================
-# ⭐ KEEP-ALIVE / CRON JOB ENDPOINT (NEW)
+# ⭐ KEEP-ALIVE / CRON JOB ENDPOINT
 # =====================================================================
 
 @app.route('/api/keep-alive', methods=['GET', 'OPTIONS'])
 @app.route('/api/cron', methods=['GET', 'OPTIONS'])
 @app.route('/health', methods=['GET', 'OPTIONS'])
 def keep_alive():
-    """
-    Health check endpoint for cron jobs and uptime monitoring
-    Render cron job isse hit karega taaki backend active rahe
-    """
     if request.method == 'OPTIONS':
         return jsonify({'success': True}), 200
     
