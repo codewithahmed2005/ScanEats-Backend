@@ -171,16 +171,18 @@ class Restaurant(db.Model):
     
     def is_trial_active(self):
         if not self.trial_start_date:
-            return False
+            # 🔥 Fix: Agar trial date null hai toh maano abhi start kiya hai (14 days active)
+            return True 
         today = datetime.utcnow().replace(hour=0, minute=0, second=0, microsecond=0)
         trial_end = self.trial_start_date + timedelta(days=14)
         return today <= trial_end
-    
+
     def get_trial_days_left(self):
+        if not self.trial_start_date:
+            # 🔥 Fix: Agar start date nahi hai toh 14 days left dikhao
+            return 14 
         if self.is_subscribed:
             return None
-        if not self.trial_start_date:
-            return 0
         today = datetime.utcnow().replace(hour=0, minute=0, second=0, microsecond=0)
         trial_end = self.trial_start_date + timedelta(days=14)
         days_left = (trial_end - today).days
