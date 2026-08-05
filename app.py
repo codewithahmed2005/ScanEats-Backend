@@ -75,8 +75,8 @@ GOOGLE_CLIENT_ID = os.environ.get('GOOGLE_CLIENT_ID')
 GOOGLE_CLIENT_SECRET = os.environ.get('GOOGLE_CLIENT_SECRET')
 APP_BASE_URL = os.environ.get('APP_BASE_URL', 'http://localhost:5000')
 
-# Get FRONTEND_URL from environment
-FRONTEND_URL = os.environ.get('FRONTEND_URL', 'https://codewithahmed2005.github.io/ScanEats')
+# ✅ FIX: Use Vercel URL for frontend redirects
+FRONTEND_URL = os.environ.get('FRONTEND_URL', 'https://scan-eats-sandy.vercel.app')
 
 # Google OAuth URLs
 GOOGLE_AUTH_URL = "https://accounts.google.com/o/oauth2/auth"
