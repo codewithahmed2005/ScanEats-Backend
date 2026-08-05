@@ -652,13 +652,19 @@ def get_subscription_status(current_restaurant):
     is_active = current_restaurant.is_subscription_active()
     has_trial = current_restaurant.is_trial_active()
     
+    # Format plan name for frontend (3_months -> 3 Months)
+    plan_display = current_restaurant.subscription_plan
+    if plan_display == '3_months': plan_display = '3 Months'
+    elif plan_display == '6_months': plan_display = '6 Months'
+    elif plan_display == '12_months': plan_display = '12 Months'
+    
     return jsonify({
         'success': True,
         'is_subscribed': current_restaurant.is_subscribed,
         'has_active_subscription': is_active,
         'has_active_trial': has_trial,
         'has_active_access': current_restaurant.has_active_access(),
-        'subscription_plan': current_restaurant.subscription_plan,
+        'subscription_plan': plan_display, # Send clean name
         'subscription_start_date': current_restaurant.subscription_start_date.isoformat() if current_restaurant.subscription_start_date else None,
         'subscription_end_date': current_restaurant.subscription_end_date.isoformat() if current_restaurant.subscription_end_date else None,
         'days_remaining': current_restaurant.get_subscription_days_left(),
