@@ -171,7 +171,6 @@ class Restaurant(db.Model):
     
     def is_trial_active(self):
         if not self.trial_start_date:
-            # 🔥 Fix: Agar trial date null hai toh maano abhi start kiya hai (14 days active)
             return True 
         today = datetime.utcnow().replace(hour=0, minute=0, second=0, microsecond=0)
         trial_end = self.trial_start_date + timedelta(days=14)
@@ -179,7 +178,6 @@ class Restaurant(db.Model):
 
     def get_trial_days_left(self):
         if not self.trial_start_date:
-            # 🔥 Fix: Agar start date nahi hai toh 14 days left dikhao
             return 14 
         if self.is_subscribed:
             return None
@@ -314,7 +312,6 @@ with app.app_context():
         columns = [col['name'] for col in inspector.get_columns('restaurant')]
         is_sqlite = 'sqlite' in str(db.engine.url)
         
-        # Make password_hash nullable if not already
         if not is_sqlite:
             with db.engine.connect() as conn:
                 result = conn.execute(text("""
@@ -544,7 +541,6 @@ def verify_payment(current_restaurant):
         if not transaction:
             return jsonify({'error': 'Transaction not found'}), 404
         
-        # ⭐ SECURITY: Check if already processed
         if transaction.status == 'SUCCESS':
             return jsonify({'error': 'Payment already verified'}), 400
         
@@ -552,17 +548,14 @@ def verify_payment(current_restaurant):
             return jsonify({'error': 'Payment was cancelled'}), 400
         
         try:
-            # ⭐ SECURITY: Verify signature
             razorpay_client.utility.verify_payment_signature({
                 'razorpay_order_id': razorpay_order_id,
                 'razorpay_payment_id': razorpay_payment_id,
                 'razorpay_signature': razorpay_signature
             })
             
-            # ⭐ SECURITY: Verify payment status from Razorpay
             payment_details = razorpay_client.payment.fetch(razorpay_payment_id)
             
-            # ⭐ SECURITY: Only allow if payment is captured
             if payment_details.get('status') != 'captured':
                 transaction.status = 'FAILED'
                 db.session.commit()
@@ -572,12 +565,10 @@ def verify_payment(current_restaurant):
                     'payment_status': payment_details.get('status')
                 }), 400
             
-            # ✅ All security checks passed — Activate subscription
             transaction.razorpay_payment_id = razorpay_payment_id
             transaction.razorpay_signature = razorpay_signature
             transaction.status = 'SUCCESS'
             
-            # ⭐ Set subscription expiry
             plan = PLANS.get(transaction.plan)
             if plan:
                 now = datetime.utcnow()
@@ -608,7 +599,6 @@ def verify_payment(current_restaurant):
 @app.route('/api/cancel-payment', methods=['POST', 'OPTIONS'])
 @token_required
 def cancel_payment(current_restaurant):
-    """⭐ NEW: Cancel payment route — Prevents auto-activation"""
     if request.method == 'OPTIONS':
         return jsonify({'success': True}), 200
     
@@ -652,7 +642,6 @@ def get_subscription_status(current_restaurant):
     is_active = current_restaurant.is_subscription_active()
     has_trial = current_restaurant.is_trial_active()
     
-    # Format plan name for frontend (3_months -> 3 Months)
     plan_display = current_restaurant.subscription_plan
     if plan_display == '3_months': plan_display = '3 Months'
     elif plan_display == '6_months': plan_display = '6 Months'
@@ -664,7 +653,7 @@ def get_subscription_status(current_restaurant):
         'has_active_subscription': is_active,
         'has_active_trial': has_trial,
         'has_active_access': current_restaurant.has_active_access(),
-        'subscription_plan': plan_display, # Send clean name
+        'subscription_plan': plan_display,
         'subscription_start_date': current_restaurant.subscription_start_date.isoformat() if current_restaurant.subscription_start_date else None,
         'subscription_end_date': current_restaurant.subscription_end_date.isoformat() if current_restaurant.subscription_end_date else None,
         'days_remaining': current_restaurant.get_subscription_days_left(),
@@ -698,7 +687,6 @@ def razorpay_webhook():
             order_id = payment_data.get('order_id')
             payment_id = payment_data.get('id')
             
-            # ⭐ SECURITY: Check payment status
             if payment_data.get('status') != 'captured':
                 print(f"⚠️ Payment not captured: {payment_data.get('status')}")
                 return jsonify({'success': False, 'error': 'Payment not captured'}), 400
@@ -953,7 +941,7 @@ def contact():
         return jsonify({'success': False, 'error': str(e)}), 500
 
 # =====================================================================
-# AUTH ROUTES
+# AUTH ROUTES (SECURE LOGIN/SIGNUP)
 # =====================================================================
 
 @app.route('/api/signup', methods=['POST', 'OPTIONS'])
@@ -963,8 +951,15 @@ def signup():
     
     data = request.get_json()
     
+    # 🔥 FIX: Check if email already exists
     if Restaurant.query.filter_by(email=data.get('email')).first():
         return jsonify({'error': 'Email already registered'}), 400
+    
+    # 🔥 FIX: Validate required fields
+    required_fields = ['restaurant_name', 'owner_name', 'email', 'password']
+    for field in required_fields:
+        if not data.get(field):
+            return jsonify({'error': f'{field.replace("_", " ").title()} is required'}), 400
     
     now = datetime.utcnow()
     trial_start = now.replace(hour=0, minute=0, second=0, microsecond=0)
@@ -1001,25 +996,35 @@ def login():
         return jsonify({'success': True}), 200
     
     data = request.get_json()
-    restaurant = Restaurant.query.filter_by(email=data.get('email')).first()
+    email = data.get('email')
+    password = data.get('password')
     
-    if restaurant and restaurant.check_password(data.get('password')):
-        token = jwt.encode({
-            'restaurant_id': restaurant.id,
-            'exp': datetime.utcnow() + timedelta(days=30)
-        }, app.config['SECRET_KEY'], algorithm="HS256")
-        
-        return jsonify({
-            'success': True,
-            'token': token,
-            'restaurant': {
-                'id': restaurant.id, 
-                'name': restaurant.restaurant_name, 
-                'owner': restaurant.owner_name
-            }
-        })
-        
-    return jsonify({'error': 'Invalid email or password'}), 401
+    # 🔥 FIX: Validate input
+    if not email or not password:
+        return jsonify({'error': 'Email and password are required'}), 400
+    
+    # 🔥 FIX: Find user by email
+    restaurant = Restaurant.query.filter_by(email=email).first()
+    
+    # 🔥 FIX: If user doesn't exist OR password is wrong, return same error (Security Best Practice)
+    if not restaurant or not restaurant.check_password(password):
+        return jsonify({'error': 'Invalid email or password'}), 401
+    
+    # 🔥 FIX: If login successful, generate token
+    token = jwt.encode({
+        'restaurant_id': restaurant.id,
+        'exp': datetime.utcnow() + timedelta(days=30)
+    }, app.config['SECRET_KEY'], algorithm="HS256")
+    
+    return jsonify({
+        'success': True,
+        'token': token,
+        'restaurant': {
+            'id': restaurant.id, 
+            'name': restaurant.restaurant_name, 
+            'owner': restaurant.owner_name
+        }
+    })
 
 @app.route('/api/me', methods=['GET', 'OPTIONS'])
 @token_required
