@@ -808,9 +808,9 @@ def google_callback():
                 db.session.commit()
         else:
             now = datetime.utcnow().replace(hour=0, minute=0, second=0, microsecond=0)
-            restaurant_name = email.split('@')[0].replace('.', ' ').title()
-            if not restaurant_name:
-                restaurant_name = "My Restaurant"
+            # 🔥 FIX: Properly assign restaurant_name for new Google users
+            resto_name = name.split()[0] if name else "My"
+            restaurant_name = f"{resto_name}'s Cafe"
             
             dummy_password = f"google_{google_id}_{email}"
             dummy_hash = generate_password_hash(dummy_password)
@@ -818,7 +818,7 @@ def google_callback():
             user = Restaurant(
                 email=email,
                 owner_name=name or restaurant_name,
-                restaurant_name=f"{restaurant_name}'s Cafe",
+                restaurant_name=restaurant_name,
                 google_id=google_id,
                 is_google_user=True,
                 profile_picture=profile_picture,
@@ -939,152 +939,6 @@ def contact():
     except Exception as e:
         print(f"❌ Contact form error: {str(e)}")
         return jsonify({'success': False, 'error': str(e)}), 500
-
-# =====================================================================
-# AUTH ROUTES (SECURE LOGIN/SIGNUP)
-# =====================================================================
-
-@app.route('/api/signup', methods=['POST', 'OPTIONS'])
-def signup():
-    if request.method == 'OPTIONS':
-        return jsonify({'success': True}), 200
-    
-    data = request.get_json()
-    
-    # 🔥 FIX: Check if email already exists
-    if Restaurant.query.filter_by(email=data.get('email')).first():
-        return jsonify({'error': 'Email already registered'}), 400
-    
-    # 🔥 FIX: Validate required fields
-    required_fields = ['restaurant_name', 'owner_name', 'email', 'password']
-    for field in required_fields:
-        if not data.get(field):
-            return jsonify({'error': f'{field.replace("_", " ").title()} is required'}), 400
-    
-    now = datetime.utcnow()
-    trial_start = now.replace(hour=0, minute=0, second=0, microsecond=0)
-    
-    restaurant = Restaurant(
-        restaurant_name=data.get('restaurant_name'),
-        owner_name=data.get('owner_name'),
-        email=data.get('email'),
-        trial_start_date=trial_start,
-        is_subscribed=False
-    )
-    restaurant.set_password(data.get('password'))
-    db.session.add(restaurant)
-    db.session.commit()
-    
-    token = jwt.encode({
-        'restaurant_id': restaurant.id,
-        'exp': datetime.utcnow() + timedelta(days=30)
-    }, app.config['SECRET_KEY'], algorithm="HS256")
-    
-    return jsonify({
-        'success': True, 
-        'token': token,
-        'restaurant': {
-            'id': restaurant.id, 
-            'name': restaurant.restaurant_name, 
-            'owner': restaurant.owner_name
-        }
-    }), 201
-
-@app.route('/api/login', methods=['POST', 'OPTIONS'])
-def login():
-    if request.method == 'OPTIONS':
-        return jsonify({'success': True}), 200
-    
-    data = request.get_json()
-    email = data.get('email')
-    password = data.get('password')
-    
-    # 🔥 FIX: Validate input
-    if not email or not password:
-        return jsonify({'error': 'Email and password are required'}), 400
-    
-    # 🔥 FIX: Find user by email
-    restaurant = Restaurant.query.filter_by(email=email).first()
-    
-    # 🔥 FIX: If user doesn't exist OR password is wrong, return same error (Security Best Practice)
-    if not restaurant or not restaurant.check_password(password):
-        return jsonify({'error': 'Invalid email or password'}), 401
-    
-    # 🔥 FIX: If login successful, generate token
-    token = jwt.encode({
-        'restaurant_id': restaurant.id,
-        'exp': datetime.utcnow() + timedelta(days=30)
-    }, app.config['SECRET_KEY'], algorithm="HS256")
-    
-    return jsonify({
-        'success': True,
-        'token': token,
-        'restaurant': {
-            'id': restaurant.id, 
-            'name': restaurant.restaurant_name, 
-            'owner': restaurant.owner_name
-        }
-    })
-
-@app.route('/api/me', methods=['GET', 'OPTIONS'])
-@token_required
-def get_me(current_restaurant):
-    return jsonify({
-        'id': current_restaurant.id,
-        'restaurant_name': current_restaurant.restaurant_name,
-        'owner_name': current_restaurant.owner_name,
-        'upi_id': current_restaurant.upi_id,
-        'logo_url': current_restaurant.logo_url,
-        'profile_picture': current_restaurant.profile_picture,
-        'is_google_user': current_restaurant.is_google_user,
-        'is_subscribed': current_restaurant.is_subscribed,
-        'subscription_plan': current_restaurant.subscription_plan,
-        'subscription_start_date': current_restaurant.subscription_start_date.isoformat() if current_restaurant.subscription_start_date else None,
-        'subscription_end_date': current_restaurant.subscription_end_date.isoformat() if current_restaurant.subscription_end_date else None,
-        'has_active_subscription': current_restaurant.is_subscription_active(),
-        'has_active_trial': current_restaurant.is_trial_active(),
-        'has_active_access': current_restaurant.has_active_access(),
-        'trial_days_left': current_restaurant.get_trial_days_left(),
-        'subscription_days_left': current_restaurant.get_subscription_days_left()
-    })
-
-# =====================================================================
-# TRIAL & SUBSCRIPTION ROUTES
-# =====================================================================
-
-@app.route('/api/trial-status', methods=['GET', 'OPTIONS'])
-@token_required
-def get_trial_status(current_restaurant):
-    if request.method == 'OPTIONS':
-        return jsonify({'success': True}), 200
-    
-    return jsonify({
-        'success': True,
-        'trial_start_date': current_restaurant.trial_start_date.isoformat() if current_restaurant.trial_start_date else None,
-        'trial_days_left': current_restaurant.get_trial_days_left(),
-        'is_trial_active': current_restaurant.is_trial_active(),
-        'is_trial_expired': current_restaurant.is_trial_expired(),
-        'is_subscribed': current_restaurant.is_subscribed,
-        'has_active_subscription': current_restaurant.is_subscription_active(),
-        'has_active_access': current_restaurant.has_active_access(),
-        'subscription_end_date': current_restaurant.subscription_end_date.isoformat() if current_restaurant.subscription_end_date else None,
-        'subscription_days_left': current_restaurant.get_subscription_days_left(),
-        'trial_duration_days': 14
-    })
-
-@app.route('/api/subscribe', methods=['POST', 'OPTIONS'])
-@token_required
-def subscribe_restaurant(current_restaurant):
-    if request.method == 'OPTIONS':
-        return jsonify({'success': True}), 200
-    
-    current_restaurant.is_subscribed = True
-    db.session.commit()
-    
-    return jsonify({
-        'success': True,
-        'message': 'Subscription activated successfully!'
-    })
 
 # =====================================================================
 # PROFILE & MENU ROUTES (WITH LOCKOUT)
