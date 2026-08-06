@@ -808,8 +808,13 @@ def google_callback():
                 db.session.commit()
         else:
             now = datetime.utcnow().replace(hour=0, minute=0, second=0, microsecond=0)
-            restaurant_name = email.split('@')[0].replace('.', ' ').title()
-            if not restaurant_name:
+            
+            # 🔥 FIX: Better logic to create restaurant name from email
+            email_prefix = email.split('@')[0]
+            # Replace dots, underscores, and dashes with spaces, then title case
+            restaurant_name = email_prefix.replace('.', ' ').replace('_', ' ').replace('-', ' ').title()
+            
+            if not restaurant_name or len(restaurant_name.strip()) < 2:
                 restaurant_name = "My Restaurant"
             
             dummy_password = f"google_{google_id}_{email}"
@@ -896,8 +901,7 @@ def contact():
             return jsonify({'success': False, 'error': 'Email is required'}), 400
         
         if not message:
-            return jsonify({'success': False, 'error': 'Message is required'}), 400
-        
+            return jsonify({'success': False, 'error': 'Message is required'}), 400        
         access_key = os.environ.get('WEB3FORMS_ACCESS_KEY')
         if not access_key:
             print("❌ WEB3FORMS_ACCESS_KEY not configured")
