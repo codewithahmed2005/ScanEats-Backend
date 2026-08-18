@@ -49,7 +49,7 @@ razorpay_client = razorpay.Client(auth=(RAZORPAY_KEY_ID, RAZORPAY_KEY_SECRET))
 # Plan Configuration
 PLANS = {
     '3_months': {
-        'amount': 50000,
+        'amount': 49900,
         'currency': 'INR',
         'duration_days': 90,
         'name': '3 Months Plan'
