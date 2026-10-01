@@ -136,6 +136,10 @@ class Restaurant(db.Model):
     upi_id = db.Column(db.String(50), nullable=True)
     logo_url = db.Column(db.String(255), nullable=True)
     
+    # Feedback Tracking Fields (NEW)
+    feedback_day7_shown = db.Column(db.Boolean, default=False)
+    feedback_day14_shown = db.Column(db.Boolean, default=False)
+    
     # Google OAuth Fields
     google_id = db.Column(db.String(255), unique=True, nullable=True)
     profile_picture = db.Column(db.String(500), nullable=True)
@@ -171,14 +175,14 @@ class Restaurant(db.Model):
     
     def is_trial_active(self):
         if not self.trial_start_date:
-            return True 
+            return True
         today = datetime.utcnow().replace(hour=0, minute=0, second=0, microsecond=0)
         trial_end = self.trial_start_date + timedelta(days=14)
         return today <= trial_end
 
     def get_trial_days_left(self):
         if not self.trial_start_date:
-            return 14 
+            return 14
         if self.is_subscribed:
             return None
         today = datetime.utcnow().replace(hour=0, minute=0, second=0, microsecond=0)
@@ -312,6 +316,19 @@ with app.app_context():
         columns = [col['name'] for col in inspector.get_columns('restaurant')]
         is_sqlite = 'sqlite' in str(db.engine.url)
         
+        # ⭐ NEW: Add feedback tracking columns
+        if 'feedback_day7_shown' not in columns:
+            with db.engine.connect() as conn:
+                if is_sqlite:
+                    conn.execute(text('ALTER TABLE restaurant ADD COLUMN feedback_day7_shown BOOLEAN DEFAULT 0'))
+                    conn.execute(text('ALTER TABLE restaurant ADD COLUMN feedback_day14_shown BOOLEAN DEFAULT 0'))
+                else:
+                    conn.execute(text('ALTER TABLE restaurant ADD COLUMN feedback_day7_shown BOOLEAN DEFAULT FALSE'))
+                    conn.execute(text('ALTER TABLE restaurant ADD COLUMN feedback_day14_shown BOOLEAN DEFAULT FALSE'))
+                conn.commit()
+            print("✅ Added feedback tracking columns")
+        
+        # Make password_hash nullable if not already
         if not is_sqlite:
             with db.engine.connect() as conn:
                 result = conn.execute(text("""
@@ -728,6 +745,128 @@ def razorpay_webhook():
         return jsonify({'error': str(e)}), 500
 
 # =====================================================================
+# ⭐ FEEDBACK ROUTES (NEW)
+# =====================================================================
+
+@app.route('/api/feedback/mark-shown', methods=['POST', 'OPTIONS'])
+@token_required
+def mark_feedback_shown(current_restaurant):
+    """Feedback popup dikhane ke baad mark karein (dobara na dikhe)"""
+    if request.method == 'OPTIONS':
+        return jsonify({'success': True}), 200
+    
+    try:
+        data = request.get_json()
+        day_type = data.get('day_type')  # 'day7' or 'day14'
+        
+        if day_type == 'day7':
+            current_restaurant.feedback_day7_shown = True
+        elif day_type == 'day14':
+            current_restaurant.feedback_day14_shown = True
+        else:
+            return jsonify({'error': 'Invalid day_type'}), 400
+        
+        db.session.commit()
+        print(f"✅ Feedback marked as shown: {day_type} for user {current_restaurant.id}")
+        return jsonify({'success': True})
+        
+    except Exception as e:
+        print(f"❌ Mark feedback error: {str(e)}")
+        return jsonify({'error': str(e)}), 500
+
+
+@app.route('/api/feedback/submit', methods=['POST', 'OPTIONS'])
+@token_required
+def submit_feedback(current_restaurant):
+    """Feedback submit karein — Web3Forms ke through email bhejein"""
+    if request.method == 'OPTIONS':
+        return jsonify({'success': True}), 200
+    
+    try:
+        data = request.get_json()
+        day_type = data.get('day_type')  # 'day7' or 'day14'
+        
+        if day_type not in ['day7', 'day14']:
+            return jsonify({'error': 'Invalid day_type'}), 400
+        
+        # Build feedback message
+        lines = [
+            f"🏪 Restaurant: {current_restaurant.restaurant_name}",
+            f"👤 Owner: {current_restaurant.owner_name or 'N/A'}",
+            f"📧 Email: {current_restaurant.email}",
+            f"🆔 User ID: {current_restaurant.id}",
+            f"📅 Feedback Type: {'Day 7 (Mid-Trial)' if day_type == 'day7' else 'Day 14 (Trial End)'}",
+            "─" * 40,
+        ]
+        
+        if day_type == 'day7':
+            lines.extend([
+                "📊 DAY 7 FEEDBACK",
+                "─" * 40,
+                f"⭐ Overall Rating: {data.get('overall_rating', 0)}/5",
+                f"⭐ Setup Rating: {data.get('setup_rating', 0)}/5",
+                f"🎯 Most Helpful Feature: {data.get('helpful_feature', 'Not selected')}",
+                f"💬 Suggestion: {data.get('suggestion', 'None')}",
+            ])
+        else:
+            lines.extend([
+                "📊 DAY 14 FEEDBACK (Trial End)",
+                "─" * 40,
+                f"⭐ Overall Rating: {data.get('overall_rating', 0)}/5",
+                f"📈 Business Benefit: {data.get('business_benefit', 'Not selected')}",
+                f"💰 Subscription Intent: {data.get('subscription_intent', 'Not selected')}",
+                f"❓ Reason (if no): {data.get('reason', 'None')}",
+                f"💬 Testimonial: {data.get('testimonial', 'None')}",
+            ])
+        
+        message = "\n".join(lines)
+        
+        # Send via Web3Forms
+        access_key = os.environ.get('WEB3FORMS_ACCESS_KEY')
+        if not access_key:
+            print("❌ WEB3FORMS_ACCESS_KEY not configured")
+            return jsonify({'error': 'Feedback not configured'}), 500
+        
+        payload = {
+            'access_key': access_key,
+            'name': f"{current_restaurant.owner_name or 'User'} (ScanEats Feedback)",
+            'email': current_restaurant.email,
+            'subject': f"⭐ ScanEats Feedback - {day_type.upper()} - {current_restaurant.restaurant_name}",
+            'message': message
+        }
+        
+        print(f"📤 Sending feedback to Web3Forms for user {current_restaurant.id}")
+        
+        response = requests.post(
+            'https://api.web3forms.com/submit',
+            json=payload,
+            timeout=30,
+            headers={'Content-Type': 'application/json'}
+        )
+        
+        result = response.json()
+        
+        if result.get('success'):
+            # Mark as shown
+            if day_type == 'day7':
+                current_restaurant.feedback_day7_shown = True
+            else:
+                current_restaurant.feedback_day14_shown = True
+            db.session.commit()
+            
+            print(f"✅ Feedback submitted successfully for user {current_restaurant.id}")
+            return jsonify({'success': True, 'message': 'Feedback submitted successfully!'})
+        else:
+            print(f"❌ Web3Forms error: {result}")
+            return jsonify({'error': 'Failed to send feedback'}), 400
+            
+    except requests.exceptions.Timeout:
+        return jsonify({'error': 'Request timed out'}), 408
+    except Exception as e:
+        print(f"❌ Feedback error: {str(e)}")
+        return jsonify({'error': str(e)}), 500
+
+# =====================================================================
 # GOOGLE OATH ROUTES
 # =====================================================================
 
@@ -809,9 +948,7 @@ def google_callback():
         else:
             now = datetime.utcnow().replace(hour=0, minute=0, second=0, microsecond=0)
             
-            # 🔥 FIX: Better logic to create restaurant name from email
             email_prefix = email.split('@')[0]
-            # Replace dots, underscores, and dashes with spaces, then title case
             restaurant_name = email_prefix.replace('.', ' ').replace('_', ' ').replace('-', ' ').title()
             
             if not restaurant_name or len(restaurant_name.strip()) < 2:
@@ -901,7 +1038,8 @@ def contact():
             return jsonify({'success': False, 'error': 'Email is required'}), 400
         
         if not message:
-            return jsonify({'success': False, 'error': 'Message is required'}), 400        
+            return jsonify({'success': False, 'error': 'Message is required'}), 400
+        
         access_key = os.environ.get('WEB3FORMS_ACCESS_KEY')
         if not access_key:
             print("❌ WEB3FORMS_ACCESS_KEY not configured")
@@ -955,11 +1093,9 @@ def signup():
     
     data = request.get_json()
     
-    # 🔥 FIX: Check if email already exists
     if Restaurant.query.filter_by(email=data.get('email')).first():
         return jsonify({'error': 'Email already registered'}), 400
     
-    # 🔥 FIX: Validate required fields
     required_fields = ['restaurant_name', 'owner_name', 'email', 'password']
     for field in required_fields:
         if not data.get(field):
@@ -1003,18 +1139,14 @@ def login():
     email = data.get('email')
     password = data.get('password')
     
-    # 🔥 FIX: Validate input
     if not email or not password:
         return jsonify({'error': 'Email and password are required'}), 400
     
-    # 🔥 FIX: Find user by email
     restaurant = Restaurant.query.filter_by(email=email).first()
     
-    # 🔥 FIX: If user doesn't exist OR password is wrong, return same error (Security Best Practice)
     if not restaurant or not restaurant.check_password(password):
         return jsonify({'error': 'Invalid email or password'}), 401
     
-    # 🔥 FIX: If login successful, generate token
     token = jwt.encode({
         'restaurant_id': restaurant.id,
         'exp': datetime.utcnow() + timedelta(days=30)
@@ -1033,6 +1165,20 @@ def login():
 @app.route('/api/me', methods=['GET', 'OPTIONS'])
 @token_required
 def get_me(current_restaurant):
+    # ⭐ Check feedback status
+    show_feedback_day7 = False
+    show_feedback_day14 = False
+    
+    if not current_restaurant.is_subscribed:
+        days_left = current_restaurant.get_trial_days_left()
+        if days_left is not None:
+            # Day 14 popup (trial ended)
+            if days_left <= 0 and not current_restaurant.feedback_day14_shown:
+                show_feedback_day14 = True
+            # Day 7 popup (7 days passed, still in trial)
+            elif days_left <= 7 and days_left > 0 and not current_restaurant.feedback_day7_shown:
+                show_feedback_day7 = True
+    
     return jsonify({
         'id': current_restaurant.id,
         'restaurant_name': current_restaurant.restaurant_name,
@@ -1049,7 +1195,10 @@ def get_me(current_restaurant):
         'has_active_trial': current_restaurant.is_trial_active(),
         'has_active_access': current_restaurant.has_active_access(),
         'trial_days_left': current_restaurant.get_trial_days_left(),
-        'subscription_days_left': current_restaurant.get_subscription_days_left()
+        'subscription_days_left': current_restaurant.get_subscription_days_left(),
+        # ⭐ NEW: Feedback flags
+        'show_feedback_day7': show_feedback_day7,
+        'show_feedback_day14': show_feedback_day14
     })
 
 # =====================================================================
